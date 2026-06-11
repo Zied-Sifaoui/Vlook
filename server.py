@@ -310,6 +310,7 @@ async def shutdown():
         STATE.cap.release()
     SCAR.close()
     BROW.close()
+    NOSE.close()
     print("[V-Look Web] Shutdown complete.")
 
 
@@ -691,6 +692,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from modes.brow_shaper import BrowShaperMode as _BrowShaperMode
 
+from modes.nose_filter import NoseRenderer as _NoseRenderer
+
+from core.geometry import GeometryEngine as _GeometryEngine
+from core.processor import FaceProcessor as _FaceProcessor
+
 
 class BrowState:
     def __init__(self):
@@ -756,6 +762,276 @@ class BrowState:
 
 BROW = BrowState()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# NOSE FILTER MODE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NoseState:
+    def __init__(self):
+        self.cap        = None
+        self.processor  = None
+        self.renderer   = None
+        self.geo        = None
+        self.running    = False
+        self._t0        = time.perf_counter()
+        self.timestamp  = 0
+        self.W = self.H = 0
+        self.K          = None
+        self.lock       = threading.Lock()
+        self.face_data  = {"found": False, "R_mat": None, "tvec": None, "landmarks": None}
+        self.params = {
+            "offset_x":   0.0,
+            "offset_y": 170.0,
+            "offset_z":   0.0,
+            "mesh_scale": 2500.0,
+            "color_r":   230,
+            "color_g":   190,
+            "color_b":   160,
+        }
+
+    def _on_result(self, result, image, ts_ms):
+        if not result.face_landmarks:
+            with self.lock:
+                self.face_data["found"] = False
+            return
+        dist  = np.zeros((4, 1), np.float32)
+        lms   = result.face_landmarks[0]
+        pts2d = np.array([[lms[i].x * self.W, lms[i].y * self.H]
+                          for i in self.geo.SOLVE_IDX], dtype=np.float32)
+        with self.lock:
+            prev_r = None
+            prev_t = self.face_data["tvec"]
+            if self.face_data["R_mat"] is not None:
+                prev_r, _ = cv2.Rodrigues(self.face_data["R_mat"])
+        ok, rvec, tvec = self.geo.solve_pose(
+            pts2d, self.K, dist, prev_rvec=prev_r, prev_tvec=prev_t)
+        if not ok:
+            return
+        R_new, _ = cv2.Rodrigues(rvec)
+        with self.lock:
+            self.face_data["R_mat"] = self.geo.smooth_rotation_matrix(
+                self.face_data["R_mat"], R_new, alpha=0.3)
+            prev_t = self.face_data["tvec"]
+            self.face_data["tvec"] = tvec if prev_t is None else (0.3 * prev_t + 0.7 * tvec)
+            self.face_data["landmarks"] = lms
+            self.face_data["found"] = True
+
+    def init(self):
+        self.geo = _GeometryEngine()
+        self.renderer = _NoseRenderer("assets/nose.obj")
+        self.processor = _FaceProcessor("models/face_landmarker.task", self._on_result)
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            raise RuntimeError("Cannot open camera for nose mode.")
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap     = cap
+        self.W       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.H       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.K       = self.geo.get_camera_matrix(self.W, self.H)
+        self._t0     = time.perf_counter()
+        self.running = True
+        print(f"[Nose] Camera ready {self.W}x{self.H}")
+
+    def grab(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return None, None, None
+        frame = cv2.flip(frame, 1)
+        self.timestamp += 33
+        self.processor.process_frame(frame, self.timestamp)
+
+        face_found = False
+
+        with self.lock:
+            fd = self.face_data
+            if fd["found"] and fd["R_mat"] is not None:
+                face_found = True
+                rvec_f, _ = cv2.Rodrigues(fd["R_mat"])
+                tvec_f = fd["tvec"]
+                p = self.params.copy()
+
+        if face_found:
+            color = (p["color_b"], p["color_g"], p["color_r"])
+            frame = self.renderer.render(
+                frame, rvec_f, tvec_f, self.K,
+                base_color  = color,
+                offset_x    = p["offset_x"],
+                offset_y    = p["offset_y"],
+                offset_z    = p["offset_z"],
+                mesh_scale  = p["mesh_scale"],
+            )
+
+        def enc(img):
+            _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            return base64.b64encode(buf.tobytes()).decode("ascii")
+
+        return enc(frame), enc(frame), face_found
+
+    def close(self):
+        self.running = False
+        if self.cap: self.cap.release()
+        if self.processor: self.processor.close()
+
+
+NOSE = NoseState()
+
+
+@app.get("/nose")
+async def nose_page():
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V-Look Nose Filter</title>
+<style>
+  :root {
+    --bg: #0e0f14; --panel: #16181f; --panel2: #1c1f2b;
+    --border: #32374a; --accent: #e0a050; --green: #28c868;
+    --cyan: #14d4e0; --red: #e03232; --text-hi: #eaeaf0;
+    --text-lo: #646878; --radius: 10px;
+    --mono: 'Space Mono', monospace; --ui: 'Rajdhani', sans-serif;
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text-hi);font-family:var(--ui);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
+  h2{font-family:var(--mono);font-weight:300;letter-spacing:3px;color:var(--accent)}
+  canvas{display:block;max-width:95vw;max-height:80vh;border-radius:8px;box-shadow:0 0 30px rgba(224,160,80,.15)}
+  .status{margin:8px 0;font-size:13px;opacity:.6;font-family:var(--mono)}
+  .controls{display:flex;gap:16px;flex-wrap:wrap;justify-content:center;background:var(--panel);padding:14px 20px;border-radius:var(--radius);border:1px solid var(--border)}
+  .ctrl{display:flex;flex-direction:column;align-items:center;gap:3px}
+  .ctrl label{font-family:var(--mono);font-size:.55rem;color:var(--text-lo);text-transform:uppercase}
+  .ctrl input[type=range]{width:120px;height:4px;border-radius:2px;background:var(--border);outline:none;cursor:pointer;-webkit-appearance:none}
+  .ctrl input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px var(--accent)}
+  .ctrl .val{font-family:var(--mono);font-size:.6rem;color:var(--text-hi)}
+  a.back{font-family:var(--mono);font-size:.55rem;color:var(--text-lo);text-decoration:none;border:1px solid var(--border);padding:5px 14px;border-radius:6px;transition:.2s}
+  a.back:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<h2>Nose Filter</h2>
+<div class="status" id="status">Connecting...</div>
+<canvas id="c"></canvas>
+<div class="controls">
+  <div class="ctrl">
+    <label>Scale</label>
+    <input type="range" id="scale" min="500" max="5000" value="2500" step="50">
+    <span class="val" id="vScale">2500</span>
+  </div>
+  <div class="ctrl">
+    <label>Offset X</label>
+    <input type="range" id="ox" min="-2000" max="2000" value="0" step="10">
+    <span class="val" id="vOx">0</span>
+  </div>
+  <div class="ctrl">
+    <label>Offset Y</label>
+    <input type="range" id="oy" min="-2000" max="2000" value="170" step="10">
+    <span class="val" id="vOy">170</span>
+  </div>
+  <div class="ctrl">
+    <label>Offset Z</label>
+    <input type="range" id="oz" min="-2000" max="2000" value="0" step="10">
+    <span class="val" id="vOz">0</span>
+  </div>
+</div>
+<a class="back" href="/">&larr; Back</a>
+<script>
+const c=document.getElementById('c'),ctx=c.getContext('2d');
+let ws=null;
+function connect(){
+  ws=new WebSocket('ws://'+location.host+'/ws/nose');
+  ws.onmessage=e=>{
+    const d=JSON.parse(e.data);
+    const img=new Image();
+    img.onload=()=>{c.width=img.width;c.height=img.height;ctx.drawImage(img,0,0)};
+    img.src='data:image/jpeg;base64,'+(d.result||d.original);
+    document.getElementById('status').textContent=d.face_found?'Face Locked':'Scanning...';
+  };
+  ws.onclose=()=>{document.getElementById('status').textContent='Disconnected. Reconnecting...';setTimeout(connect,1000)};
+  ws.onerror=()=>ws.close();
+}
+connect();
+
+let ctrlWs=null;
+function connectCtrl(){
+  ctrlWs=new WebSocket('ws://'+location.host+'/ws/nose/controls');
+  ctrlWs.onopen=()=>send();
+  ctrlWs.onerror=()=>setTimeout(connectCtrl,2000);
+  ctrlWs.onclose=()=>setTimeout(connectCtrl,2000);
+}
+connectCtrl();
+
+function bind(id,vid){const el=document.getElementById(id),vl=document.getElementById(vid);vl.textContent=el.value;el.addEventListener('input',()=>{vl.textContent=el.value;send()})}
+bind('scale','vScale');bind('ox','vOx');bind('oy','vOy');bind('oz','vOz');
+
+function send(){
+  if(ctrlWs&&ctrlWs.readyState===WebSocket.OPEN)
+    ctrlWs.send(JSON.stringify({
+      offset_x:+document.getElementById('ox').value,
+      offset_y:+document.getElementById('oy').value,
+      offset_z:+document.getElementById('oz').value,
+      mesh_scale:+document.getElementById('scale').value,
+    }));
+}
+</script>
+</body>
+</html>
+""")
+
+
+@app.websocket("/ws/nose")
+async def ws_nose(ws: WebSocket):
+    await ws.accept()
+    if not NOSE.running:
+        try:
+            loop2 = asyncio.get_event_loop()
+            await loop2.run_in_executor(None, NOSE.init)
+        except Exception as e:
+            await ws.send_text(json.dumps({"error": str(e)}))
+            await ws.close()
+            return
+
+    loop2 = asyncio.get_event_loop()
+    try:
+        while True:
+            try:
+                _, result_b64, face_found = await loop2.run_in_executor(None, NOSE.grab)
+            except Exception as e:
+                print(f"[Nose] Frame grab error: {e}")
+                await asyncio.sleep(0.1)
+                continue
+            if result_b64 is None:
+                await asyncio.sleep(0.02)
+                continue
+            await ws.send_text(json.dumps({"result": result_b64, "face_found": face_found}))
+            await asyncio.sleep(0.001)
+    except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError):
+        print("[Nose] Client disconnected")
+    except asyncio.CancelledError:
+        print("[Nose] Server shutting down")
+    except Exception as e:
+        print(f"[Nose WS] error: {e}")
+        traceback.print_exc()
+
+
+@app.websocket("/ws/nose/controls")
+async def ws_nose_ctrl(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            data = json.loads(await ws.receive_text())
+            with NOSE.lock:
+                for key in ("offset_x", "offset_y", "offset_z", "mesh_scale"):
+                    if key in data:
+                        NOSE.params[key] = float(data[key])
+            await ws.send_text(json.dumps({"ok": True}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[Nose Ctrl WS] error: {e}")
+
 
 @app.get("/brow")
 async def brow_page():
@@ -779,6 +1055,7 @@ async def brow_page():
 <h2>&#x2728; Brow Shaper</h2>
 <div class="status" id="status">Connecting...</div>
 <canvas id="c"></canvas>
+<p style="margin-top:6px"><a href="/nose" style="font-family:'Space Mono',monospace;font-size:.55rem;color:#646878;text-decoration:none;border:1px solid #32374a;padding:4px 12px;border-radius:6px">Nose Filter &rarr;</a></p>
 <script>
 const c = document.getElementById('c'), ctx = c.getContext('2d');
 let ws = null;
