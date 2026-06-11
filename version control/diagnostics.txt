@@ -1,0 +1,308 @@
+"""
+AR Diagnostics — Face Landmark Inspector
+=========================================
+Shows EXACTLY what landmarks look like, where solvePnP places things,
+and lets you tune the glasses placement live.
+
+Run:  python ar_diagnostics.py --model face_landmarker.task --cam 0
+
+What you'll see:
+  GREEN dots  = the 11 solvePnP anchor landmarks
+  CYAN lines  = eye-to-eye axis + nose bridge marker
+  YELLOW box  = reprojected glasses bounding rect (no OBJ needed)
+  MAGENTA dot = projected nose bridge (where glasses center lands)
+  WHITE text  = live coordinate printout
+
+Press:
+  P  = print current rvec/tvec/landmark values to terminal
+  ESC/Q = quit
+"""
+
+import cv2
+import numpy as np
+import mediapipe as mp
+import time, sys, argparse, threading, urllib.request, os
+
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import (
+    FaceLandmarker, FaceLandmarkerOptions, FaceLandmarkerResult
+)
+from mediapipe.tasks.python.vision.core.vision_task_running_mode import VisionTaskRunningMode
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--model', default='face_landmarker.task')
+parser.add_argument('--cam',   type=int, default=0)
+parser.add_argument('--width', type=int, default=1280)
+parser.add_argument('--height',type=int, default=720)
+parser.add_argument('--download-model', action='store_true')
+args = parser.parse_args()
+
+MODEL_URL = ('https://storage.googleapis.com/mediapipe-models/'
+             'face_landmarker/face_landmarker/float16/1/face_landmarker.task')
+if args.download_model:
+    print(f'Downloading -> {args.model}')
+    urllib.request.urlretrieve(MODEL_URL, args.model,
+        reporthook=lambda b,bs,t: print(f'\r  {min(b*bs,t)//1024}/{t//1024} KB', end='', flush=True))
+    print('\nDone.'); sys.exit(0)
+
+if not os.path.exists(args.model):
+    print(f'ERROR: {args.model} not found. Run with --download-model'); sys.exit(1)
+
+# ── Canonical 3D reference points ────────────────────────────────────────────
+CANONICAL_3D = {
+    1:   ( 0.000,  0.082, -2.467),
+    6:   ( 0.000,  1.146, -4.170),
+    33:  (-4.445,  1.327, -3.173),
+    263: ( 4.445,  1.327, -3.173),
+    61:  (-2.456, -1.940, -3.566),
+    291: ( 2.456, -1.940, -3.566),
+    199: ( 0.000, -3.406, -2.699),
+    10:  ( 0.000,  5.516, -3.484),
+    234: (-7.503,  0.000, -5.220),
+    454: ( 7.503,  0.000, -5.220),
+    152: ( 0.000, -7.742, -5.483),
+}
+SOLVE_LM_IDX = list(CANONICAL_3D.keys())
+FACE_3D_REF  = np.array(list(CANONICAL_3D.values()), dtype=np.float32)
+NOSE_BRIDGE_3D = np.array([[0.0, 1.146, -4.170]], dtype=np.float32)
+
+LM_LABELS = {
+    1:'nose_tip', 6:'nose_bridge', 33:'L_eye_out', 263:'R_eye_out',
+    61:'L_mouth', 291:'R_mouth', 199:'chin_mid', 10:'forehead',
+    234:'L_temple', 454:'R_temple', 152:'chin_bot'
+}
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+class State:
+    def __init__(self):
+        self.lock       = threading.Lock()
+        self.lms        = None
+        self.rvec       = None
+        self.tvec       = None
+        self.face_found = False
+        self.pts2d_raw  = {}   # lm_idx -> (px, py)
+
+state = State()
+_cam_K = None
+_dist  = np.zeros((4,1), np.float32)
+
+EMA = 0.4
+_rvec_e = None
+_tvec_e = None
+
+def on_result(result: FaceLandmarkerResult, image, timestamp_ms):
+    global _rvec_e, _tvec_e, _cam_K
+
+    if not result.face_landmarks or _cam_K is None:
+        with state.lock: state.face_found = False
+        return
+
+    lms   = result.face_landmarks[0]
+    W_img = image.width
+    H_img = image.height
+
+    pts2d_raw = {i: (lms[i].x * W_img, lms[i].y * H_img) for i in SOLVE_LM_IDX}
+    pts2d = np.array([[lms[i].x*W_img, lms[i].y*H_img] for i in SOLVE_LM_IDX], np.float32)
+
+    ok, rvec, tvec = cv2.solvePnP(FACE_3D_REF, pts2d, _cam_K, _dist,
+                                   flags=cv2.SOLVEPNP_ITERATIVE)
+    if not ok:
+        with state.lock: state.face_found = False
+        return
+
+    # Refine with more iterations
+    rvec, tvec = cv2.solvePnPRefineLM(FACE_3D_REF, pts2d, _cam_K, _dist, rvec, tvec)
+
+    if _rvec_e is None:
+        _rvec_e, _tvec_e = rvec.copy(), tvec.copy()
+    else:
+        _rvec_e = EMA*_rvec_e + (1-EMA)*rvec
+        _tvec_e = EMA*_tvec_e + (1-EMA)*tvec
+
+    with state.lock:
+        state.lms       = lms
+        state.rvec      = _rvec_e.copy()
+        state.tvec      = _tvec_e.copy()
+        state.face_found= True
+        state.pts2d_raw = pts2d_raw
+
+# ── Build landmarker ──────────────────────────────────────────────────────────
+opts = FaceLandmarkerOptions(
+    base_options               = mp_python.BaseOptions(model_asset_path=args.model),
+    running_mode               = VisionTaskRunningMode.LIVE_STREAM,
+    num_faces                  = 1,
+    min_face_detection_confidence = 0.5,
+    min_face_presence_confidence  = 0.5,
+    min_tracking_confidence       = 0.5,
+    output_face_blendshapes       = False,
+    output_facial_transformation_matrixes = False,
+    result_callback            = on_result,
+)
+landmarker = FaceLandmarker.create_from_options(opts)
+print('Landmarker ready')
+
+# ── Camera ────────────────────────────────────────────────────────────────────
+cap = cv2.VideoCapture(args.cam)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+print(f'Camera: {W}x{H}')
+
+_cam_K = np.array([[W,0,W/2],[0,W,H/2],[0,0,1]], np.float32)
+
+WIN = 'AR Diagnostics'
+cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(WIN, min(W,1280), min(H,720))
+
+def nothing(x): pass
+cv2.createTrackbar('Focal %', WIN, 100, 200, nothing)   # 100 = focal=W
+
+ts_ms = 0
+frame_times = []
+
+print('\nP=print values  ESC/Q=quit')
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+    frame = cv2.flip(frame, 1)
+    ts_ms += 33
+
+    # Update focal from trackbar
+    focal_pct = cv2.getTrackbarPos('Focal %', WIN) / 100.0
+    _cam_K[0,0] = W * focal_pct
+    _cam_K[1,1] = W * focal_pct
+
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
+                      data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    landmarker.detect_async(mp_img, ts_ms)
+
+    with state.lock:
+        face_found = state.face_found
+        rvec       = state.rvec.copy()       if state.rvec  is not None else None
+        tvec       = state.tvec.copy()       if state.tvec  is not None else None
+        lms        = state.lms
+        pts2d_raw  = dict(state.pts2d_raw)
+
+    display = frame.copy()
+
+    # ── Draw ALL 478 landmarks faintly ────────────────────────────────────
+    if lms is not None:
+        for i in range(len(lms)):
+            px = int(lms[i].x * W)
+            py = int(lms[i].y * H)
+            if 0 <= px < W and 0 <= py < H:
+                cv2.circle(display, (px, py), 1, (60, 60, 60), -1)
+
+    if face_found and rvec is not None:
+        # ── Draw the 11 solvePnP INPUT landmarks (GREEN) ──────────────────
+        for lm_idx, (px, py) in pts2d_raw.items():
+            ipx, ipy = int(px), int(py)
+            cv2.circle(display, (ipx, ipy), 8, (0, 255, 0), -1)
+            cv2.circle(display, (ipx, ipy), 9, (0, 180, 0), 2)
+            label = LM_LABELS.get(lm_idx, str(lm_idx))
+            cv2.putText(display, label, (ipx+10, ipy-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0,255,0), 1)
+
+        # ── Reproject those same canonical 3D points (CYAN) ──────────────
+        # If GREEN and CYAN dots overlap perfectly → solvePnP is accurate
+        proj_pts, _ = cv2.projectPoints(FACE_3D_REF, rvec, tvec, _cam_K, _dist)
+        reproj_err = 0.0
+        for i, pt in enumerate(proj_pts.reshape(-1,2)):
+            ipx, ipy = int(pt[0]), int(pt[1])
+            cv2.circle(display, (ipx, ipy), 5, (255,255,0), -1)  # YELLOW reprojection
+            # compute reprojection error
+            raw = pts2d_raw[SOLVE_LM_IDX[i]]
+            reproj_err += np.sqrt((pt[0]-raw[0])**2 + (pt[1]-raw[1])**2)
+        reproj_err /= len(FACE_3D_REF)
+
+        # ── Project nose bridge (MAGENTA) — this is where glasses center goes
+        nb_proj, _ = cv2.projectPoints(NOSE_BRIDGE_3D, rvec, tvec, _cam_K, _dist)
+        nb_px = int(nb_proj[0,0,0])
+        nb_py = int(nb_proj[0,0,1])
+        cv2.circle(display, (nb_px, nb_py), 12, (255, 0, 255), -1)
+        cv2.circle(display, (nb_px, nb_py), 14, (200, 0, 200), 2)
+        cv2.putText(display, 'GLASSES CENTER', (nb_px+15, nb_py),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 2)
+
+        # ── Project eye corners (RED) ─────────────────────────────────────
+        eye_3d = np.array([[-4.445, 1.327, -3.173],
+                           [ 4.445, 1.327, -3.173]], np.float32)
+        eye_proj, _ = cv2.projectPoints(eye_3d, rvec, tvec, _cam_K, _dist)
+        for ep in eye_proj.reshape(-1,2):
+            cv2.circle(display, (int(ep[0]),int(ep[1])), 10, (0,0,255), -1)
+        # Draw glasses width line
+        if len(eye_proj) == 2:
+            ep0 = (int(eye_proj[0,0,0]), int(eye_proj[0,0,1]))
+            ep1 = (int(eye_proj[1,0,0]), int(eye_proj[1,0,1]))
+            cv2.line(display, ep0, ep1, (0,0,255), 2)
+            eye_dist_px = np.linalg.norm(np.array(ep0)-np.array(ep1))
+            cv2.putText(display, f'eye_w={eye_dist_px:.0f}px',
+                        ((ep0[0]+ep1[0])//2-30, ep0[1]-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+
+        # ── Info panel ────────────────────────────────────────────────────
+        r_deg = np.degrees(rvec.ravel())
+        t_val = tvec.ravel()
+        focal_v = _cam_K[0,0]
+
+        lines = [
+            f'Focal: {focal_v:.0f} px  (trackbar to tune)',
+            f'Reproj err: {reproj_err:.2f} px  (want <5)',
+            f'Rvec: {r_deg[0]:.1f} {r_deg[1]:.1f} {r_deg[2]:.1f} deg',
+            f'Tvec: {t_val[0]:.2f} {t_val[1]:.2f} {t_val[2]:.2f}',
+            f'Nose bridge px: ({nb_px}, {nb_py})',
+            '',
+            'GREEN = landmark input',
+            'YELLOW = reprojected (should overlap GREEN)',
+            'MAGENTA = glasses center',
+            'RED line = glasses width span',
+        ]
+        px0, py0 = 10, H - len(lines)*22 - 15
+        cv2.rectangle(display, (px0-5, py0-5),
+                      (px0+390, py0+len(lines)*22+5), (0,0,0), -1)
+        for i, line in enumerate(lines):
+            col = (200,255,200) if line else (100,100,100)
+            if 'GREEN' in line:   col=(0,255,0)
+            if 'YELLOW' in line:  col=(0,255,255)
+            if 'MAGENTA' in line: col=(255,100,255)
+            if 'RED' in line:     col=(80,80,255)
+            if 'err' in line:
+                col = (0,255,0) if reproj_err < 3 else (0,200,255) if reproj_err < 8 else (0,60,255)
+            cv2.putText(display, line, (px0, py0+i*22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+
+    else:
+        cv2.putText(display, 'NO FACE DETECTED — look at camera',
+                    (W//2-200, H//2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,60,255), 2)
+
+    # FPS
+    now = time.perf_counter()
+    frame_times.append(now)
+    frame_times = [t for t in frame_times if now-t < 1.0]
+    fps = len(frame_times)
+
+    cv2.rectangle(display, (0,0),(W,50),(0,0,0),-1)
+    cv2.putText(display, f'FPS {fps}  |  DIAGNOSTIC MODE  |  P=print  ESC=quit',
+                (10,33), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 1)
+    cv2.putText(display, f'Focal trackbar: tune until YELLOW overlaps GREEN',
+                (W-500,33), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150,200,255), 1)
+
+    cv2.imshow(WIN, display)
+    key = cv2.waitKey(1) & 0xFF
+    if key in (27, ord('q'), ord('Q')): break
+    elif key in (ord('p'), ord('P')):
+        print('\n=== CURRENT VALUES ===')
+        if rvec is not None:
+            print(f'Focal:  {_cam_K[0,0]:.1f} px')
+            print(f'rvec:   {rvec.ravel()}')
+            print(f'tvec:   {tvec.ravel()}')
+            if pts2d_raw:
+                for idx, (x,y) in pts2d_raw.items():
+                    print(f'  LM {idx:3d} ({LM_LABELS[idx]:12s}): ({x:.1f}, {y:.1f})')
+
+cap.release()
+landmarker.close()
+cv2.destroyAllWindows()
