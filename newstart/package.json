@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "bleak": "^0.1.0"
+  }
+}
