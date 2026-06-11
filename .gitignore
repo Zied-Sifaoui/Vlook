@@ -1,9 +1,12 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pyc
 node_modules/
 screenshots/
 .vscode/
 .idea/
 *.task
 *.glb
+serviceAccountKey.json
+smartMiror*/
