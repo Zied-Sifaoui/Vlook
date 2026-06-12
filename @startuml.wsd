@@ -1,0 +1,131 @@
+@startuml
+
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam ranksep 50
+skinparam nodesep 40
+
+skinparam usecase {
+  BackgroundColor #F5F5F0
+  BorderColor #888888
+  BorderThickness 1
+  FontSize 13
+  FontColor #222222
+}
+
+skinparam actor {
+  BackgroundColor transparent
+  BorderColor transparent
+  FontSize 13
+  FontColor #222222
+}
+
+skinparam rectangle {
+  BackgroundColor #FFFFFF
+  BorderColor #888888
+  BorderThickness 1
+  FontSize 12
+  FontColor #222222
+}
+
+skinparam ArrowColor #666666
+skinparam ArrowFontSize 11
+skinparam ArrowFontColor #666666
+
+skinparam note {
+  BackgroundColor #FFFFFF
+  BorderColor #AAAAAA
+  FontSize 11
+  FontColor #555555
+}
+
+left to right direction
+
+' ═══════════════════════════════
+' LEFT ACTORS
+' ═══════════════════════════════
+actor " " as Patient <<human>>
+note bottom of Patient
+  Patient
+end note
+
+actor " " as Doctor <<human>>
+note bottom of Doctor
+  Doctor /\nMedical practitioner
+end note
+
+Patient -[hidden]down- Doctor
+
+' ═══════════════════════════════
+' SYSTEM BOUNDARY
+' ═══════════════════════════════
+rectangle "AI-Based AR Medical Visualization System" as System {
+
+  usecase "Authenticate (Firebase Auth)" as UC_Auth
+  usecase "Select surgery type"          as UC_Select
+  usecase "Pre-operative health check"   as UC_PreOp
+  usecase "Sign language interaction"    as UC_Sign
+  usecase "Before / after review"        as UC_BeforeAfter
+  usecase "View doctor dashboard"        as UC_Dashboard
+  usecase "Sync session data"            as UC_Sync
+
+  UC_Auth        -[hidden]down- UC_Select
+  UC_Select      -[hidden]down- UC_PreOp
+  UC_PreOp       -[hidden]down- UC_Sign
+  UC_Sign        -[hidden]down- UC_BeforeAfter
+  UC_BeforeAfter -[hidden]down- UC_Dashboard
+  UC_Dashboard   -[hidden]down- UC_Sync
+}
+
+' ═══════════════════════════════
+' RIGHT ACTORS (boxes, not people)
+' ═══════════════════════════════
+rectangle "  <<device>>\n  Jetson Nano  " as Jetson
+rectangle "  <<system>>\n  Firebase Firestore  " as Firebase
+
+Jetson -[hidden]down- Firebase
+
+' ═══════════════════════════════
+' ASSOCIATIONS — left to use cases
+' ═══════════════════════════════
+Patient --> UC_Auth
+Patient --> UC_Select
+Patient --> UC_PreOp
+Patient --> UC_Sign
+Patient --> UC_BeforeAfter
+Doctor  --> UC_Dashboard
+
+' ═══════════════════════════════
+' ASSOCIATIONS — use cases to right
+' ═══════════════════════════════
+UC_Select    ..> Jetson   : «include»
+UC_Dashboard ..> Firebase : «include»
+UC_Sync      ..> Firebase : «include»
+
+' ═══════════════════════════════
+' EXTEND / INCLUDE
+' ═══════════════════════════════
+UC_PreOp ..> UC_Sign        : «extend»
+UC_PreOp ..> UC_BeforeAfter : «extend»
+UC_Dashboard ..> UC_Sync    : «include»
+
+' ═══════════════════════════════
+' NOTES
+' ═══════════════════════════════
+note on link
+  «extend»\n(deaf patients)
+end note
+
+note right of UC_BeforeAfter
+  «extend»\n(optional)
+end note
+
+' ═══════════════════════════════
+' LEGEND
+' ═══════════════════════════════
+legend bottom
+  |  —  | Association (actor → use case) |
+  |  - -  | «include» / «extend» dependency |
+endlegend
+
+@enduml

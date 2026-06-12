@@ -1,13 +1,14 @@
 __pycache__/
 *.pyc
 *.pyo
-*.pyc
 node_modules/
 screenshots/
 .vscode/
 .idea/
 *.glb
 serviceAccountKey.json
-smartMiror*/
 medar-3214d-firebase-adminsdk-fbsvc-679e0072ab.json
 version control/
+
+# Large model files not tracked
+assets/3d/hair.obj

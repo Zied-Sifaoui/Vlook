@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FaceAR – AI Beauty Effects</title>
+  <style>
+    /* ── Reset & Base ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:       #0d0d14;
+      --surface:  #16161f;
+      --card:     #1e1e2e;
+      --card-hov: #252538;
+      --primary:  #a78bfa;
+      --accent:   #f472b6;
+      --green:    #4ade80;
+      --red:      #f87171;
+      --text:     #e2e8f0;
+      --muted:    #94a3b8;
+      --border:   #2e2e45;
+      --radius:   18px;
+      --glow: 0 0 24px rgba(167,139,250,.25);
+    }
+    html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); }
+
+    /* ── Scrollbar ────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Header ──────────────────────────────────────────── */
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 18px 32px;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; z-index: 100;
+      backdrop-filter: blur(12px);
+    }
+    .logo { display: flex; align-items: center; gap: 12px; }
+    .logo-icon { font-size: 28px; }
+    .logo-text h1 { font-size: 22px; font-weight: 700; background: linear-gradient(135deg, var(--primary), var(--accent)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .logo-text p  { font-size: 12px; color: var(--muted); margin-top: 1px; }
+
+    #status-badge {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 16px; border-radius: 999px;
+      background: var(--card); border: 1px solid var(--border);
+      font-size: 13px; font-weight: 500;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+    .dot.connected    { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .dot.disconnected { background: var(--red);   box-shadow: 0 0 8px var(--red); }
+    .dot.checking     { background: #facc15; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+    /* ── Views ───────────────────────────────────────────── */
+    #view-home, #view-camera { min-height: calc(100vh - 65px); }
+    .hidden { display: none !important; }
+
+    /* ── Home View ───────────────────────────────────────── */
+    #view-home { padding: 32px; }
+    .section-title {
+      font-size: 15px; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 1.2px;
+      margin-bottom: 20px; display: flex; align-items: center; gap: 10px;
+    }
+    .section-title::after { content:''; flex:1; height:1px; background: var(--border); }
+
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+      gap: 16px;
+    }
+
+    .feature-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px 16px;
+      cursor: pointer;
+      transition: transform .2s, box-shadow .2s, border-color .2s, background .2s;
+      text-align: center;
+      position: relative; overflow: hidden;
+    }
+    .feature-card::before {
+      content: '';
+      position: absolute; inset: 0;
+      background: linear-gradient(135deg, rgba(167,139,250,.07), rgba(244,114,182,.07));
+      opacity: 0; transition: opacity .2s;
+    }
+    .feature-card:hover { transform: translateY(-4px); box-shadow: var(--glow); border-color: var(--primary); background: var(--card-hov); }
+    .feature-card:hover::before { opacity: 1; }
+    .feature-card:active { transform: translateY(-1px); }
+
+    .card-emoji { font-size: 40px; margin-bottom: 12px; display: block; }
+    .card-name  { font-size: 15px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+    .card-cat   {
+      display: inline-block; font-size: 10px; font-weight: 600;
+      padding: 2px 10px; border-radius: 999px;
+      background: rgba(167,139,250,.15); color: var(--primary);
+      text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px;
+    }
+    .card-desc  { font-size: 12px; color: var(--muted); line-height: 1.5; }
+
+    /* ── Camera View ──────────────────────────────────────── */
+    #view-camera {
+      display: flex; flex-direction: column;
+      background: #000;
+    }
+
+    .cam-header {
+      display: flex; align-items: center; gap: 14px;
+      padding: 16px 24px;
+      background: rgba(0,0,0,.7); border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+    }
+    #btn-back {
+      background: var(--card); border: 1px solid var(--border);
+      color: var(--text); border-radius: 10px;
+      padding: 8px 16px; cursor: pointer; font-size: 14px;
+      transition: background .15s;
+    }
+    #btn-back:hover { background: var(--card-hov); }
+    .cam-title { font-size: 18px; font-weight: 700; }
+    .cam-subtitle { font-size: 12px; color: var(--muted); }
+
+    #cam-status {
+      margin-left: auto; display: flex; align-items: center; gap: 8px;
+      font-size: 13px; color: var(--muted);
+    }
+    #fps-counter { color: var(--primary); font-weight: 600; font-size: 13px; }
+
+    /* ── Split Screen ────────────────────────────────────── */
+    .split-view {
+      flex: 1; display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2px; background: var(--border);
+      min-height: 0;
+    }
+    .panel {
+      position: relative; background: #0a0a0f;
+      display: flex; align-items: center; justify-content: center;
+      overflow: hidden;
+    }
+    .panel-label {
+      position: absolute; top: 12px; left: 12px;
+      background: rgba(0,0,0,.6); color: var(--muted);
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .8px; padding: 4px 10px; border-radius: 6px;
+      backdrop-filter: blur(4px); z-index: 2;
+    }
+    #video-original {
+      width: 100%; height: 100%; object-fit: cover;
+      transform: scaleX(-1); /* mirror */
+    }
+    #img-processed {
+      width: 100%; height: 100%; object-fit: cover;
+      transform: scaleX(-1);
+    }
+
+    .panel-placeholder {
+      display: flex; flex-direction: column; align-items: center; gap: 12px;
+      color: var(--muted);
+    }
+    .panel-placeholder span { font-size: 36px; }
+    .panel-placeholder p   { font-size: 13px; text-align: center; }
+
+    /* Spinner */
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid var(--border);
+      border-top-color: var(--primary);
+      border-radius: 50%; animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Controls Bar ────────────────────────────────────── */
+    .controls-bar {
+      display: flex; align-items: center; justify-content: center; gap: 12px;
+      padding: 14px 24px;
+      background: rgba(0,0,0,.8); border-top: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+    }
+    .ctrl-btn {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 20px; border-radius: 10px;
+      border: 1px solid var(--border); background: var(--card);
+      color: var(--text); cursor: pointer; font-size: 14px; font-weight: 500;
+      transition: all .15s;
+    }
+    .ctrl-btn:hover { background: var(--card-hov); border-color: var(--primary); }
+    .ctrl-btn.active { background: rgba(167,139,250,.2); border-color: var(--primary); color: var(--primary); }
+    .ctrl-btn.danger:hover { border-color: var(--red); color: var(--red); }
+
+    /* ── Error Toast ─────────────────────────────────────── */
+    #toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: #1e1e2e; border: 1px solid var(--red);
+      color: var(--text); padding: 12px 24px; border-radius: 12px;
+      font-size: 14px; z-index: 999;
+      transition: opacity .3s; pointer-events: none;
+    }
+    #toast.hidden { opacity: 0; }
+
+    /* ── Responsive ──────────────────────────────────────── */
+    @media (max-width: 700px) {
+      .split-view { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+      header { padding: 14px 16px; }
+      #view-home { padding: 16px; }
+      .features-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────────────────── -->
+<header>
+  <div class="logo">
+    <span class="logo-icon">🎭</span>
+    <div class="logo-text">
+      <h1>FaceAR</h1>
+      <p>AI Beauty Effects</p>
+    </div>
+  </div>
+  <div id="status-badge">
+    <div class="dot checking" id="status-dot"></div>
+    <span id="status-text">Checking…</span>
+  </div>
+</header>
+
+<!-- ── Home View ──────────────────────────────────────────── -->
+<div id="view-home">
+  <p class="section-title">Select a Feature</p>
+  <div class="features-grid" id="features-grid">
+    <!-- Injected by JS -->
+  </div>
+</div>
+
+<!-- ── Camera View ────────────────────────────────────────── -->
+<div id="view-camera" class="hidden">
+
+  <div class="cam-header">
+    <button id="btn-back">← Back</button>
+    <div>
+      <div class="cam-title" id="cam-title">Feature</div>
+      <div class="cam-subtitle" id="cam-subtitle">Loading…</div>
+    </div>
+    <div id="cam-status">
+      <span id="fps-counter">0 fps</span>
+    </div>
+  </div>
+
+  <div class="split-view">
+    <!-- Original -->
+    <div class="panel" id="panel-original">
+      <div class="panel-label">Original</div>
+      <video id="video-original" autoplay muted playsinline></video>
+    </div>
+
+    <!-- Processed -->
+    <div class="panel" id="panel-processed">
+      <div class="panel-label">Processed</div>
+      <div class="panel-placeholder" id="processed-placeholder">
+        <div class="spinner"></div>
+        <p>Waiting for first frame…</p>
+      </div>
+      <img id="img-processed" class="hidden" alt="Processed frame" />
+    </div>
+  </div>
+
+  <div class="controls-bar">
+    <button class="ctrl-btn active" id="btn-toggle">⏸ Pause</button>
+    <button class="ctrl-btn" id="btn-snapshot">📸 Snapshot</button>
+    <button class="ctrl-btn danger" id="btn-stop">■ Stop Camera</button>
+  </div>
+</div>
+
+<!-- ── Toast ──────────────────────────────────────────────── -->
+<div id="toast" class="hidden"></div>
+
+<!-- Hidden canvas for frame capture -->
+<canvas id="capture-canvas" style="display:none"></canvas>
+
+<script>
+// ── Feature definitions ──────────────────────────────────────
+const FEATURES = [
+  { id: "fox_eye",       name: "Fox Eyes",      category: "Eyes",  emoji: "👁",  desc: "Cat-eye lifting effect" },
+  { id: "eyelid_lift",   name: "Eyelid Lift",   category: "Eyes",  emoji: "✨",  desc: "Natural eyelid enhancement" },
+  { id: "lips",          name: "Lip Beautify",  category: "Lips",  emoji: "💋",  desc: "Lip color and shape enhancement" },
+  { id: "nose",          name: "Nose Reshape",  category: "Nose",  emoji: "👃",  desc: "Virtual nose overlay" },
+  { id: "hair_overlay",  name: "Hair Overlay",  category: "Hair",  emoji: "💇",  desc: "Virtual hairstyle overlay" },
+  { id: "hair_color",    name: "Hair Color",    category: "Hair",  emoji: "🎨",  desc: "Change your hair color" },
+  { id: "jaw",           name: "Jaw V-Shape",   category: "Face",  emoji: "💎",  desc: "Jaw slimming and contouring" },
+  { id: "scar",          name: "Scar Removal",  category: "Skin",  emoji: "🌟",  desc: "Detect and conceal scars" },
+  { id: "sign_language", name: "Sign Language", category: "Hands", emoji: "🤟",  desc: "Hand sign landmark detection" },
+];
+
+// ── State ────────────────────────────────────────────────────
+let stream       = null;
+let activeFeature = null;
+let processing   = false;  // loop running
+let paused       = false;
+let lastTime     = performance.now();
+let frameCount   = 0;
+let animId       = null;
+
+// ── DOM refs ─────────────────────────────────────────────────
+const viewHome      = document.getElementById('view-home');
+const viewCamera    = document.getElementById('view-camera');
+const grid          = document.getElementById('features-grid');
+const video         = document.getElementById('video-original');
+const imgProcessed  = document.getElementById('img-processed');
+const placeholder   = document.getElementById('processed-placeholder');
+const canvas        = document.getElementById('capture-canvas');
+const ctx           = canvas.getContext('2d');
+const btnBack       = document.getElementById('btn-back');
+const btnToggle     = document.getElementById('btn-toggle');
+const btnSnapshot   = document.getElementById('btn-snapshot');
+const btnStop       = document.getElementById('btn-stop');
+const camTitle      = document.getElementById('cam-title');
+const camSubtitle   = document.getElementById('cam-subtitle');
+const fpsCounter    = document.getElementById('fps-counter');
+const statusDot     = document.getElementById('status-dot');
+const statusText    = document.getElementById('status-text');
+const toast         = document.getElementById('toast');
+
+// ── Build feature grid ───────────────────────────────────────
+FEATURES.forEach(f => {
+  const card = document.createElement('div');
+  card.className = 'feature-card';
+  card.innerHTML = `
+    <span class="card-emoji">${f.emoji}</span>
+    <div class="card-name">${f.name}</div>
+    <span class="card-cat">${f.category}</span>
+    <div class="card-desc">${f.desc}</div>
+  `;
+  card.addEventListener('click', () => openFeature(f));
+  grid.appendChild(card);
+});
+
+// ── Server status check ──────────────────────────────────────
+async function checkServer() {
+  try {
+    const res = await fetch('/ping', { signal: AbortSignal.timeout(3000) });
+    if (res.ok) {
+      statusDot.className = 'dot connected';
+      statusText.textContent = 'Server Connected';
+      return true;
+    }
+  } catch (_) {}
+  statusDot.className = 'dot disconnected';
+  statusText.textContent = 'Server Offline';
+  return false;
+}
+checkServer();
+setInterval(checkServer, 10000);
+
+// ── Open feature ─────────────────────────────────────────────
+async function openFeature(feature) {
+  const ok = await checkServer();
+  if (!ok) { showToast('Server is offline. Run start_server.bat first.'); return; }
+
+  activeFeature = feature;
+  camTitle.textContent      = feature.name;
+  camSubtitle.textContent   = feature.desc;
+  fpsCounter.textContent    = '0 fps';
+  imgProcessed.classList.add('hidden');
+  placeholder.style.display = 'flex';
+  placeholder.innerHTML     = '<div class="spinner"></div><p>Starting camera…</p>';
+  paused = false;
+  btnToggle.textContent = '⏸ Pause';
+  btnToggle.classList.add('active');
+
+  viewHome.classList.add('hidden');
+  viewCamera.classList.remove('hidden');
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
+    });
+    video.srcObject = stream;
+    await new Promise(r => video.onloadedmetadata = r);
+    canvas.width  = video.videoWidth  || 640;
+    canvas.height = video.videoHeight || 480;
+    placeholder.innerHTML = '<div class="spinner"></div><p>Warming up AI model…</p>';
+    startLoop();
+  } catch (e) {
+    showToast('Cannot access camera: ' + e.message);
+    goHome();
+  }
+}
+
+// ── Processing loop ──────────────────────────────────────────
+function startLoop() {
+  processing = true;
+  scheduleNext();
+}
+
+function scheduleNext() {
+  if (!processing) return;
+  animId = requestAnimationFrame(runFrame);
+}
+
+let inFlight = false;  // prevent overlapping requests
+
+async function runFrame() {
+  if (!processing) return;
+  if (paused || inFlight) { scheduleNext(); return; }
+
+  inFlight = true;
+  try {
+    // Capture frame
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    // Get base64 JPEG (strip data URL prefix)
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.65);
+    const b64     = dataUrl.split(',')[1];
+
+    // Send to server
+    const res = await fetch('/process', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ feature: activeFeature.id, frame: b64 }),
+      signal:  AbortSignal.timeout(8000)
+    });
+
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+
+    if (data.success && data.frame) {
+      imgProcessed.src = 'data:image/jpeg;base64,' + data.frame;
+      if (imgProcessed.classList.contains('hidden')) {
+        imgProcessed.classList.remove('hidden');
+        placeholder.style.display = 'none';
+      }
+      // FPS
+      frameCount++;
+      const now = performance.now();
+      if (now - lastTime >= 1000) {
+        fpsCounter.textContent = frameCount + ' fps';
+        frameCount = 0;
+        lastTime   = now;
+      }
+    }
+  } catch (e) {
+    // silent — just skip the frame
+  } finally {
+    inFlight = false;
+    scheduleNext();
+  }
+}
+
+// ── Controls ─────────────────────────────────────────────────
+btnToggle.addEventListener('click', () => {
+  paused = !paused;
+  btnToggle.textContent = paused ? '▶ Resume' : '⏸ Pause';
+  btnToggle.classList.toggle('active', !paused);
+});
+
+btnSnapshot.addEventListener('click', () => {
+  if (!imgProcessed.src) return;
+  const a   = document.createElement('a');
+  a.href    = imgProcessed.src;
+  a.download = `facear_${activeFeature.id}_${Date.now()}.jpg`;
+  a.click();
+});
+
+btnStop.addEventListener('click', stopCamera);
+btnBack.addEventListener('click',  goHome);
+
+function stopCamera() {
+  processing = false;
+  if (animId) cancelAnimationFrame(animId);
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.srcObject = null;
+}
+
+function goHome() {
+  stopCamera();
+  viewCamera.classList.add('hidden');
+  viewHome.classList.remove('hidden');
+  activeFeature = null;
+}
+
+// ── Toast ─────────────────────────────────────────────────────
+let toastTimer = null;
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.remove('hidden');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.add('hidden'), 4000);
+}
+</script>
+</body>
+</html>
