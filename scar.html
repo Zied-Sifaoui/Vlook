@@ -130,7 +130,9 @@ input[type=range].cyan::-webkit-slider-thumb{background:var(--cyan);box-shadow:0
     <div class="sep"></div>
     <a class="nav-btn" href="/">Hair AR</a>
     <a class="nav-btn active" href="/scar">Scar Removal</a>
+    <a class="nav-btn" href="/brow">Brow Shaper</a>
     <a class="nav-btn" href="/nose">Nose Filter</a>
+    <a class="nav-btn" href="/mouth">Mouth</a>
     <div class="sep"></div>
     <div class="dot" id="dot"></div>
     <span class="st" id="st">CONNECTING...</span>
@@ -243,7 +245,7 @@ input[type=range].cyan::-webkit-slider-thumb{background:var(--cyan);box-shadow:0
 </div>
 
 <script>
-const HOST = location.hostname + ':8000';
+const HOST = location.host;
 const DEFAULTS = { alpha:0.4, threshold:0.35, inpaint_r:5 };
 
 // ── Canvas setup ─────────────────────────────────────────────────────────
@@ -374,12 +376,12 @@ function connectVid() {
     const f  = fpsBuf.reduce((a,b)=>a+b,0)/fpsBuf.length;
     const fe = document.getElementById('fps');
     fe.textContent = f.toFixed(1);
-    fe.style.color = f>=20?'var(--green)':f>=12?'var(--cyan)':'var(--red)';
+    fe.style.color = f>=20?'var(--green)':f>=12?'var(--cyan)':'#e03232';
   };
   vidWs.onerror = () => showErr('Cannot reach server on port 8000.');
   vidWs.onclose = () => {
     document.getElementById('wsb').textContent = 'WS OFF';
-    document.getElementById('wsb').style.color = 'var(--red)';
+    document.getElementById('wsb').style.color = '#e03232';
     document.getElementById('overlay').style.display = 'flex';
     setTimeout(connectVid, 2500);
   };
@@ -424,6 +426,14 @@ document.getElementById('showMask').addEventListener('change', () => {
 updateLive();
 connectVid();
 connectCtrl();
+// Auto-redirect if mode changes away from scar
+setInterval(async () => {
+  try {
+    const r = await fetch('/mode');
+    const d = await r.json();
+    if (d.mode !== 'scar') window.location.href = '/';
+  } catch {}
+}, 1000);
 </script>
 </body>
 </html>

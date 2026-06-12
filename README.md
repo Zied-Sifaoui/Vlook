@@ -132,7 +132,6 @@ python check_gpu.py # See what acceleration is available
 
 - **No requirements.txt** — dependencies are scattered across server.py docstrings and this README; use `pip freeze > requirements.txt` to lock versions
 - **server.py is too long** (837 lines) — AR rendering, scar removal, and brow shaper are all in one file; should be split into separate modules/routers
-- **Camera settings are hardcoded** — 640×480 @ index 0; no GUI for camera selection
 - **Missing error recovery** — if the camera fails mid-stream, the server doesn't auto-restart
 - **U-Net weights path** — hardcoded as `unet_scar.pth`; should be configurable via env var
 - **No automated tests** — no pytest or unit tests for core components

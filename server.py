@@ -8,10 +8,16 @@ Requirements:
 
 import asyncio
 import base64
+import concurrent.futures
+import faulthandler
 import json
 import threading
 import time
 import traceback
+faulthandler.enable()
+
+# Dedicated single-thread executor for all OpenGL/camera work
+_gl_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gl")
 
 import cv2
 import numpy as np
@@ -24,6 +30,7 @@ from core.processor import FaceProcessor
 from core.renderer  import ARRenderer
 from core.geometry  import GeometryEngine
 from core.face_mask import build_face_depth_map
+from firestore_watcher import FirestoreWatcher
 
 app = FastAPI()
 
@@ -47,6 +54,7 @@ class AppState:
         self.K         = None
         self._t0       = time.perf_counter()
         self.running   = False
+        self.ready     = threading.Event()
 
         # ── Defaults ────────────────────────────────────────────────────────
         # After the renderer fix, Z=0 means mesh straddles the face plane.
@@ -71,6 +79,22 @@ class AppState:
 
     def get_style(self):
         return self.presets[self.params["style_idx"] % len(self.presets)]
+
+    def close(self):
+        self.running = False
+        self.ready.clear()
+        if self.processor:
+            try:
+                self.processor.close()
+            except Exception:
+                pass
+            self.processor = None
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
 
 
 STATE = AppState()
@@ -127,7 +151,8 @@ def on_result(result, image, ts_ms):
 def init_camera():
     STATE.geo       = GeometryEngine()
     STATE.renderer  = ARRenderer("assets/hair.obj", normalize_span=4.0)
-    STATE.processor = FaceProcessor("models/face_landmarker.task", on_result)
+    if STATE.processor is None:
+        STATE.processor = FaceProcessor("models/face_landmarker.task", on_result)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -142,6 +167,7 @@ def init_camera():
     STATE.K       = STATE.geo.get_camera_matrix(STATE.W, STATE.H)
     STATE._t0     = time.perf_counter()
     STATE.running = True
+    STATE.ready.set()
     print(f"[V-Look Web] Camera {STATE.W}x{STATE.H} ready")
 
 
@@ -159,7 +185,8 @@ def grab_processed_frame():
 
     frame = cv2.flip(frame, 1)
     ts_ms = int((time.perf_counter() - STATE._t0) * 1000)
-    STATE.processor.process_frame(frame, ts_ms)
+    if STATE.processor is not None:
+        STATE.processor.process_frame(frame, ts_ms)
 
     face_found = False
     lms_f = p = None
@@ -189,16 +216,21 @@ def grab_processed_frame():
             face_depth = build_face_depth_map(
                 lms_f, STATE.W, STATE.H, rvec_f, tvec_f, STATE.K)
 
-        frame = STATE.renderer.render(
-            frame, rvec_f, tvec_f, STATE.K,
-            style          = STATE.get_style(),
-            offset_x       = p["offset_x"],
-            offset_y       = p["offset_y"],
-            offset_z       = p["offset_z"],
-            mesh_scale     = p["mesh_scale"],
-            face_depth_map = face_depth,
-            occ_margin     = 15.0,
-        )
+        try:
+            frame = STATE.renderer.render(
+                frame, rvec_f, tvec_f, STATE.K,
+                style          = STATE.get_style(),
+                offset_x       = p["offset_x"],
+                offset_y       = p["offset_y"],
+                offset_z       = p["offset_z"],
+                mesh_scale     = p["mesh_scale"],
+                face_depth_map = face_depth,
+                occ_margin     = 15.0,
+            )
+        except Exception as e:
+            print(f"[Render] Error: {e}")
+            traceback.print_exc()
+            face_found = False
 
     dbg_lines = [
         f"X:{p['offset_x']:+.0f}  Y:{p['offset_y']:+.0f}  Z:{p['offset_z']:+.0f}  S:{p['mesh_scale']:.0f}" if face_found else "NO FACE",
@@ -208,7 +240,8 @@ def grab_processed_frame():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                     (0, 210, 170), 1, cv2.LINE_AA)
 
-    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    small = cv2.resize(frame, (320, 240))
+    _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 75])
     return buf.tobytes(), face_found
 
 
@@ -236,22 +269,32 @@ async def get_defaults():
 # ─────────────────────────────────────────────────────────────────────────────
 # WebSocket — video
 # ─────────────────────────────────────────────────────────────────────────────
+def close_camera():
+    STATE.running = False
+    if STATE.cap:
+        try:
+            STATE.cap.release()
+        except Exception:
+            pass
+
+
 @app.websocket("/ws/video")
 async def ws_video(ws: WebSocket):
     await ws.accept()
+    for _ in range(50):
+        if STATE.running:
+            break
+        await asyncio.sleep(0.1)
     if not STATE.running:
-        try:
-            init_camera()
-        except Exception as e:
-            await ws.send_text(json.dumps({"error": str(e)}))
-            await ws.close()
-            return
+        await ws.send_text(json.dumps({"error": "Camera not ready"}))
+        await ws.close()
+        return
 
     loop = asyncio.get_event_loop()
     try:
         while True:
             try:
-                frame_bytes, face_found = await loop.run_in_executor(None, grab_processed_frame)
+                frame_bytes, face_found = await loop.run_in_executor(_gl_executor, grab_processed_frame)
             except Exception as e:
                 print(f"[V-Look Web] Frame grab error: {e}")
                 await asyncio.sleep(0.1)
@@ -263,6 +306,7 @@ async def ws_video(ws: WebSocket):
             await ws.send_text(json.dumps({"frame": b64, "face_found": face_found}))
             await asyncio.sleep(0.001)
     except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError):
+        close_camera()
         print("[V-Look Web] Client disconnected")
     except asyncio.CancelledError:
         print("[V-Look Web] Server shutting down")
@@ -274,8 +318,17 @@ async def ws_video(ws: WebSocket):
 # ─────────────────────────────────────────────────────────────────────────────
 # WebSocket — controls
 # ─────────────────────────────────────────────────────────────────────────────
+_ctrl_conn_count = 0
+_ctrl_conn_lock = threading.Lock()
+
 @app.websocket("/ws/controls")
 async def ws_controls(ws: WebSocket):
+    global _ctrl_conn_count
+    with _ctrl_conn_lock:
+        if _ctrl_conn_count >= 3:
+            await ws.close(1013, "Too many control connections")
+            return
+        _ctrl_conn_count += 1
     await ws.accept()
     try:
         while True:
@@ -290,6 +343,61 @@ async def ws_controls(ws: WebSocket):
         pass
     except Exception as e:
         print(f"[Controls WS] error: {e}")
+    finally:
+        with _ctrl_conn_lock:
+            _ctrl_conn_count -= 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Firestore mode control
+# ─────────────────────────────────────────────────────────────────────────────
+SERVICE_ACCOUNT = os.path.join(os.path.dirname(__file__),
+                               "medar-3214d-firebase-adminsdk-fbsvc-679e0072ab.json")
+FW = FirestoreWatcher(SERVICE_ACCOUNT, "jetson_control", "active_filter", "option")
+CURRENT_MODE = "hair"
+_mode_lock = threading.Lock()
+
+
+def _close_all_modes():
+    STATE.close()
+    SCAR.close()
+    BROW.close()
+    NOSE.close()
+    MOUTH.close()
+    # Let the camera settle
+    time.sleep(0.3)
+
+
+def _switch_mode(raw_mode):
+    global CURRENT_MODE
+    # Normalize aliases to canonical mode names
+    _ALIASES = {"style_1": "hair", "brow_1": "brow", "brow_2": "brow", "mouth_full": "mouth"}
+    mode = _ALIASES.get(raw_mode, raw_mode)
+    with _mode_lock:
+        if mode == CURRENT_MODE:
+            return
+        print(f"[Mode] Switching: {CURRENT_MODE} -> {raw_mode} (canonical: {mode})")
+        _close_all_modes()
+        if mode == "hair":
+            init_camera()
+            mode = "hair"
+        elif mode == "nose":
+            NOSE.init()
+            mode = "nose"
+        elif mode == "scar":
+            SCAR.init()
+            mode = "scar"
+        elif mode == "brow":
+            BROW.init()
+            mode = "brow"
+        elif mode == "mouth":
+            MOUTH.init()
+            mode = "mouth"
+        else:
+            print(f"[Mode] Unknown mode {mode!r}, falling back to hair")
+            init_camera()
+            mode = "hair"
+        CURRENT_MODE = mode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,20 +406,35 @@ async def ws_controls(ws: WebSocket):
 @app.on_event("startup")
 async def startup():
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, init_camera)
+
+    def _on_firestore_change(val):
+        mode = (val or "hair").lower()
+        if mode != CURRENT_MODE:
+            asyncio.run_coroutine_threadsafe(
+                _switch_mode_async(mode), loop)
+
+    async def _switch_mode_async(mode):
+        await loop.run_in_executor(_gl_executor, _switch_mode, mode)
+
+    FW.on_change(_on_firestore_change)
+    FW.start()
+    await loop.run_in_executor(_gl_executor, init_camera)
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    STATE.running = False
-    if STATE.processor:
-        STATE.processor.close()
-    if STATE.cap:
-        STATE.cap.release()
+    FW.stop()
+    STATE.close()
     SCAR.close()
     BROW.close()
     NOSE.close()
+    MOUTH.close()
     print("[V-Look Web] Shutdown complete.")
+
+
+@app.get("/mode")
+async def get_mode():
+    return {"mode": CURRENT_MODE, "desired": FW.get() or CURRENT_MODE}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -523,7 +646,8 @@ class ScarState:
         return _mp_vision.FaceLandmarker.create_from_options(opts)
 
     def init(self):
-        self.landmarker = self._build_landmarker()
+        if not hasattr(self, 'landmarker') or self.landmarker is None:
+            self.landmarker = self._build_landmarker()
         cap = cv2.VideoCapture(0)
         if not cap.isOpened(): raise RuntimeError("Cannot open camera for scar mode.")
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -531,6 +655,7 @@ class ScarState:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.cap = cap
         self.running = True
+        STATE.ready.set()
 
         if _HAS_TORCH:
             try:
@@ -612,14 +737,18 @@ class ScarState:
             result = frame.copy()
 
         def enc(img):
-            _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            s = cv2.resize(img, (320, 240))
+            _, buf = cv2.imencode(".jpg", s, [cv2.IMWRITE_JPEG_QUALITY, 75])
             return base64.b64encode(buf.tobytes()).decode("ascii")
         return enc(frame), enc(result)
 
     def close(self):
         self.running = False
-        if self.cap: self.cap.release()
-        if self.landmarker: self.landmarker.close()
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
 
 SCAR = ScarState()
@@ -635,20 +764,20 @@ async def scar_page():
 @app.websocket("/ws/scar")
 async def ws_scar(ws: WebSocket):
     await ws.accept()
+    for _ in range(50):
+        if SCAR.running:
+            break
+        await asyncio.sleep(0.1)
     if not SCAR.running:
-        try:
-            loop2 = asyncio.get_event_loop()
-            await loop2.run_in_executor(None, SCAR.init)
-        except Exception as e:
-            await ws.send_text(json.dumps({"error": str(e)}))
-            await ws.close()
-            return
+        await ws.send_text(json.dumps({"error": "Scar filter not ready"}))
+        await ws.close()
+        return
 
     loop2 = asyncio.get_event_loop()
     try:
         while True:
             try:
-                orig_b64, result_b64 = await loop2.run_in_executor(None, SCAR.grab)
+                orig_b64, result_b64 = await loop2.run_in_executor(_gl_executor, SCAR.grab)
             except Exception as e:
                 print(f"[Scar] Frame grab error: {e}")
                 await asyncio.sleep(0.1)
@@ -662,6 +791,7 @@ async def ws_scar(ws: WebSocket):
             }))
             await asyncio.sleep(0.001)
     except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError):
+        SCAR.close()
         print("[Scar] Client disconnected")
     except asyncio.CancelledError:
         print("[Scar] Server shutting down")
@@ -694,6 +824,8 @@ from modes.brow_shaper import BrowShaperMode as _BrowShaperMode
 
 from modes.nose_filter import NoseRenderer as _NoseRenderer
 
+from modes.mouth_correction import MouthCorrection as _MouthCorrection
+
 from core.geometry import GeometryEngine as _GeometryEngine
 from core.processor import FaceProcessor as _FaceProcessor
 
@@ -701,29 +833,11 @@ from core.processor import FaceProcessor as _FaceProcessor
 class BrowState:
     def __init__(self):
         self.cap        = None
-        self.landmarker = None
         self.running    = False
         self._t0        = time.perf_counter()
-        self.timestamp  = 0
         self.brow       = _BrowShaperMode()
 
-    def _build_landmarker(self):
-        base = _mp_python.BaseOptions(
-            model_asset_path="models/face_landmarker.task")
-        opts = _mp_vision.FaceLandmarkerOptions(
-            base_options=base,
-            running_mode=_mp_vision.RunningMode.VIDEO,
-            num_faces=1,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-            output_face_blendshapes=False,
-            output_facial_transformation_matrixes=False,
-        )
-        return _mp_vision.FaceLandmarker.create_from_options(opts)
-
     def init(self):
-        self.landmarker = self._build_landmarker()
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             raise RuntimeError("Cannot open camera for brow mode.")
@@ -732,39 +846,82 @@ class BrowState:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.cap     = cap
         self.running = True
-        print("[Brow] Camera ready")
+        STATE.ready.set()
+        self.brow._init_models()
+        self.brow.start_speech()
+        print("[Brow] Camera + Speech ready")
 
     def grab(self):
         ret, frame = self.cap.read()
         if not ret:
-            return None, None
+            return None, None, "", ""
         frame = cv2.flip(frame, 1)
-        h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        self.timestamp += 33
-        result = self.landmarker.detect_for_video(mp_img, self.timestamp)
-        lms = result.face_landmarks[0] if result.face_landmarks else None
-        if lms is not None:
-            frame = self.brow.process(frame, lms, w, h)
+        frame, gesture, speech_text, speech_status = self.brow.process(frame)
 
         def enc(img):
-            _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            s = cv2.resize(img, (320, 240))
+            _, buf = cv2.imencode(".jpg", s, [cv2.IMWRITE_JPEG_QUALITY, 75])
             return base64.b64encode(buf.tobytes()).decode("ascii")
 
-        return enc(frame), enc(frame)
+        return enc(frame), gesture, speech_text, speech_status
 
     def close(self):
         self.running = False
-        if self.cap: self.cap.release()
-        if self.landmarker: self.landmarker.close()
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
 
 BROW = BrowState()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NOSE FILTER MODE
+# MOUTH CORRECTION MODE
 # ─────────────────────────────────────────────────────────────────────────────
+
+class MouthState:
+    def __init__(self):
+        self.cap        = None
+        self.running    = False
+        self._t0        = time.perf_counter()
+        self.mouth      = _MouthCorrection()
+
+    def init(self):
+        self.mouth.reset_smooth()
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            raise RuntimeError("Cannot open camera for mouth mode.")
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap     = cap
+        self.running = True
+        STATE.ready.set()
+        print("[Mouth] Camera ready")
+
+    def grab(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return None, None, None
+        frame = cv2.flip(frame, 1)
+        result, face_found = self.mouth.process(frame)
+        small = cv2.resize(result, (320, 240))
+        _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+        return b64, b64, face_found
+
+    def close(self):
+        self.running = False
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        self.cap = None
+
+
+MOUTH = MouthState()
 
 class NoseState:
     def __init__(self):
@@ -778,15 +935,16 @@ class NoseState:
         self.W = self.H = 0
         self.K          = None
         self.lock       = threading.Lock()
+        self._frame_count = 0
         self.face_data  = {"found": False, "R_mat": None, "tvec": None, "landmarks": None}
         self.params = {
-            "offset_x":   0.0,
-            "offset_y": 170.0,
-            "offset_z":   0.0,
-            "mesh_scale": 2500.0,
-            "color_r":   230,
-            "color_g":   190,
-            "color_b":   160,
+            "offset_x":  -15.0,
+            "offset_y":  -110.0,
+            "offset_z":  -100.0,
+            "mesh_scale": 135.0,
+            "color_r":   255,
+            "color_g":   219,
+            "color_b":   172,
         }
 
     def _on_result(self, result, image, ts_ms):
@@ -794,23 +952,61 @@ class NoseState:
             with self.lock:
                 self.face_data["found"] = False
             return
-        dist  = np.zeros((4, 1), np.float32)
-        lms   = result.face_landmarks[0]
-        pts2d = np.array([[lms[i].x * self.W, lms[i].y * self.H]
+        lms = result.face_landmarks[0]
+        W, H = self.W, self.H
+
+        # -- Use nose landmarks directly for yaw/pitch/roll --
+        tip  = np.array([lms[1].x * W,   lms[1].y * H])
+        mid  = np.array([lms[168].x * W, lms[168].y * H])
+        leye = np.array([lms[33].x * W,  lms[33].y * H])
+        reye = np.array([lms[263].x * W, lms[263].y * H])
+
+        eye_dist = np.linalg.norm(reye - leye) + 1e-6
+        nd = tip - mid                        # nose direction in image (px)
+
+        # Yaw: horizontal offset of tip relative to bridge
+        #   Mirrored frame: user turns left → nd.x < 0
+        #   → yaw < 0  (nose rotates left in the rendered view)
+        yaw = np.arctan2(nd[0], eye_dist * 2.5)
+
+        # Pitch: vertical deviation from rest nose length
+        rest_len = 0.08 * W
+        pitch = np.arctan2(rest_len - nd[1], eye_dist * 2.5)
+
+        # Roll: eye-line angle
+        roll = np.arctan2(reye[1] - leye[1], reye[0] - leye[0])
+
+        # Build rotation: Ry(yaw) @ Rx(pitch) @ Rz(roll) @ R_base
+        # R_base = 180° around X — matches solvePnP model→camera convention
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cr, sr = np.cos(roll), np.sin(roll)
+
+        R = np.array([
+            [cy*cr + sy*sp*sr,  -cy*sr + sy*sp*cr,  sy*cp],
+            [cp*sr,              cp*cr,             -sp   ],
+            [-sy*cr + cy*sp*sr,  sy*sr + cy*sp*cr,  cy*cp],
+        ], dtype=np.float32)
+
+        # Base rotation: model +z → camera −z (nose toward camera)
+        R_base = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)
+        R = R @ R_base
+
+        # -- Translation: solvePnP for tvec (full solve, then discard its R) --
+        dist = np.zeros((4, 1), np.float32)
+        pts2d = np.array([[lms[i].x * W, lms[i].y * H]
                           for i in self.geo.SOLVE_IDX], dtype=np.float32)
         with self.lock:
-            prev_r = None
+            prev_r = cv2.Rodrigues(self.face_data["R_mat"])[0] if self.face_data["R_mat"] is not None else None
             prev_t = self.face_data["tvec"]
-            if self.face_data["R_mat"] is not None:
-                prev_r, _ = cv2.Rodrigues(self.face_data["R_mat"])
-        ok, rvec, tvec = self.geo.solve_pose(
+        ok, _, tvec = self.geo.solve_pose(
             pts2d, self.K, dist, prev_rvec=prev_r, prev_tvec=prev_t)
         if not ok:
             return
-        R_new, _ = cv2.Rodrigues(rvec)
+
         with self.lock:
             self.face_data["R_mat"] = self.geo.smooth_rotation_matrix(
-                self.face_data["R_mat"], R_new, alpha=0.3)
+                self.face_data["R_mat"], R, alpha=0.25)
             prev_t = self.face_data["tvec"]
             self.face_data["tvec"] = tvec if prev_t is None else (0.3 * prev_t + 0.7 * tvec)
             self.face_data["landmarks"] = lms
@@ -818,8 +1014,9 @@ class NoseState:
 
     def init(self):
         self.geo = _GeometryEngine()
-        self.renderer = _NoseRenderer("assets/nose.obj")
-        self.processor = _FaceProcessor("models/face_landmarker.task", self._on_result)
+        self.renderer = _NoseRenderer("assets/nose.obj", normalize_span=1.5, baseline=(10, 50, -950))
+        if not hasattr(self, 'processor') or self.processor is None:
+            self.processor = _FaceProcessor("models/face_landmarker.task", self._on_result)
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             raise RuntimeError("Cannot open camera for nose mode.")
@@ -832,6 +1029,7 @@ class NoseState:
         self.K       = self.geo.get_camera_matrix(self.W, self.H)
         self._t0     = time.perf_counter()
         self.running = True
+        STATE.ready.set()
         print(f"[Nose] Camera ready {self.W}x{self.H}")
 
     def grab(self):
@@ -840,7 +1038,11 @@ class NoseState:
             return None, None, None
         frame = cv2.flip(frame, 1)
         self.timestamp += 33
-        self.processor.process_frame(frame, self.timestamp)
+
+        self._frame_count += 1
+        small = cv2.resize(frame, (320, 240))
+        if self._frame_count % 2 == 0:
+            self.processor.process_frame(small, self.timestamp)
 
         face_found = False
 
@@ -864,15 +1066,19 @@ class NoseState:
             )
 
         def enc(img):
-            _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            s = cv2.resize(img, (320, 240))
+            _, buf = cv2.imencode(".jpg", s, [cv2.IMWRITE_JPEG_QUALITY, 75])
             return base64.b64encode(buf.tobytes()).decode("ascii")
 
         return enc(frame), enc(frame), face_found
 
     def close(self):
         self.running = False
-        if self.cap: self.cap.release()
-        if self.processor: self.processor.close()
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
 
 NOSE = NoseState()
@@ -880,124 +1086,30 @@ NOSE = NoseState()
 
 @app.get("/nose")
 async def nose_page():
-    return HTMLResponse("""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V-Look Nose Filter</title>
-<style>
-  :root {
-    --bg: #0e0f14; --panel: #16181f; --panel2: #1c1f2b;
-    --border: #32374a; --accent: #e0a050; --green: #28c868;
-    --cyan: #14d4e0; --red: #e03232; --text-hi: #eaeaf0;
-    --text-lo: #646878; --radius: 10px;
-    --mono: 'Space Mono', monospace; --ui: 'Rajdhani', sans-serif;
-  }
-  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--text-hi);font-family:var(--ui);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
-  h2{font-family:var(--mono);font-weight:300;letter-spacing:3px;color:var(--accent)}
-  canvas{display:block;max-width:95vw;max-height:80vh;border-radius:8px;box-shadow:0 0 30px rgba(224,160,80,.15)}
-  .status{margin:8px 0;font-size:13px;opacity:.6;font-family:var(--mono)}
-  .controls{display:flex;gap:16px;flex-wrap:wrap;justify-content:center;background:var(--panel);padding:14px 20px;border-radius:var(--radius);border:1px solid var(--border)}
-  .ctrl{display:flex;flex-direction:column;align-items:center;gap:3px}
-  .ctrl label{font-family:var(--mono);font-size:.55rem;color:var(--text-lo);text-transform:uppercase}
-  .ctrl input[type=range]{width:120px;height:4px;border-radius:2px;background:var(--border);outline:none;cursor:pointer;-webkit-appearance:none}
-  .ctrl input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px var(--accent)}
-  .ctrl .val{font-family:var(--mono);font-size:.6rem;color:var(--text-hi)}
-  a.back{font-family:var(--mono);font-size:.55rem;color:var(--text-lo);text-decoration:none;border:1px solid var(--border);padding:5px 14px;border-radius:6px;transition:.2s}
-  a.back:hover{border-color:var(--accent);color:var(--accent)}
-</style>
-</head>
-<body>
-<h2>Nose Filter</h2>
-<div class="status" id="status">Connecting...</div>
-<canvas id="c"></canvas>
-<div class="controls">
-  <div class="ctrl">
-    <label>Scale</label>
-    <input type="range" id="scale" min="500" max="5000" value="2500" step="50">
-    <span class="val" id="vScale">2500</span>
-  </div>
-  <div class="ctrl">
-    <label>Offset X</label>
-    <input type="range" id="ox" min="-2000" max="2000" value="0" step="10">
-    <span class="val" id="vOx">0</span>
-  </div>
-  <div class="ctrl">
-    <label>Offset Y</label>
-    <input type="range" id="oy" min="-2000" max="2000" value="170" step="10">
-    <span class="val" id="vOy">170</span>
-  </div>
-  <div class="ctrl">
-    <label>Offset Z</label>
-    <input type="range" id="oz" min="-2000" max="2000" value="0" step="10">
-    <span class="val" id="vOz">0</span>
-  </div>
-</div>
-<a class="back" href="/">&larr; Back</a>
-<script>
-const c=document.getElementById('c'),ctx=c.getContext('2d');
-let ws=null;
-function connect(){
-  ws=new WebSocket('ws://'+location.host+'/ws/nose');
-  ws.onmessage=e=>{
-    const d=JSON.parse(e.data);
-    const img=new Image();
-    img.onload=()=>{c.width=img.width;c.height=img.height;ctx.drawImage(img,0,0)};
-    img.src='data:image/jpeg;base64,'+(d.result||d.original);
-    document.getElementById('status').textContent=d.face_found?'Face Locked':'Scanning...';
-  };
-  ws.onclose=()=>{document.getElementById('status').textContent='Disconnected. Reconnecting...';setTimeout(connect,1000)};
-  ws.onerror=()=>ws.close();
-}
-connect();
-
-let ctrlWs=null;
-function connectCtrl(){
-  ctrlWs=new WebSocket('ws://'+location.host+'/ws/nose/controls');
-  ctrlWs.onopen=()=>send();
-  ctrlWs.onerror=()=>setTimeout(connectCtrl,2000);
-  ctrlWs.onclose=()=>setTimeout(connectCtrl,2000);
-}
-connectCtrl();
-
-function bind(id,vid){const el=document.getElementById(id),vl=document.getElementById(vid);vl.textContent=el.value;el.addEventListener('input',()=>{vl.textContent=el.value;send()})}
-bind('scale','vScale');bind('ox','vOx');bind('oy','vOy');bind('oz','vOz');
-
-function send(){
-  if(ctrlWs&&ctrlWs.readyState===WebSocket.OPEN)
-    ctrlWs.send(JSON.stringify({
-      offset_x:+document.getElementById('ox').value,
-      offset_y:+document.getElementById('oy').value,
-      offset_z:+document.getElementById('oz').value,
-      mesh_scale:+document.getElementById('scale').value,
-    }));
-}
-</script>
-</body>
-</html>
-""")
+    import os
+    base = os.path.dirname(__file__)
+    path = os.path.join(base, "nose.html")
+    with open(path, encoding="utf-8") as f:
+        return HTMLResponse(f.read())
 
 
 @app.websocket("/ws/nose")
 async def ws_nose(ws: WebSocket):
     await ws.accept()
+    for _ in range(50):
+        if NOSE.running:
+            break
+        await asyncio.sleep(0.1)
     if not NOSE.running:
-        try:
-            loop2 = asyncio.get_event_loop()
-            await loop2.run_in_executor(None, NOSE.init)
-        except Exception as e:
-            await ws.send_text(json.dumps({"error": str(e)}))
-            await ws.close()
-            return
+        await ws.send_text(json.dumps({"error": "Nose filter not ready"}))
+        await ws.close()
+        return
 
     loop2 = asyncio.get_event_loop()
     try:
         while True:
             try:
-                _, result_b64, face_found = await loop2.run_in_executor(None, NOSE.grab)
+                _, result_b64, face_found = await loop2.run_in_executor(_gl_executor, NOSE.grab)
             except Exception as e:
                 print(f"[Nose] Frame grab error: {e}")
                 await asyncio.sleep(0.1)
@@ -1008,6 +1120,7 @@ async def ws_nose(ws: WebSocket):
             await ws.send_text(json.dumps({"result": result_b64, "face_found": face_found}))
             await asyncio.sleep(0.001)
     except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError):
+        NOSE.close()
         print("[Nose] Client disconnected")
     except asyncio.CancelledError:
         print("[Nose] Server shutting down")
@@ -1026,6 +1139,9 @@ async def ws_nose_ctrl(ws: WebSocket):
                 for key in ("offset_x", "offset_y", "offset_z", "mesh_scale"):
                     if key in data:
                         NOSE.params[key] = float(data[key])
+                for key in ("color_r", "color_g", "color_b"):
+                    if key in data:
+                        NOSE.params[key] = int(data[key])
             await ws.send_text(json.dumps({"ok": True}))
     except WebSocketDisconnect:
         pass
@@ -1033,46 +1149,561 @@ async def ws_nose_ctrl(ws: WebSocket):
         print(f"[Nose Ctrl WS] error: {e}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MOUTH CORRECTION MODE — routes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/mouth")
+async def mouth_page():
+    return HTMLResponse("""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>V-Look &mdash; Mouth Correction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0e0f14;--panel:#16181f;--panel2:#1c1f2b;--border:#32374a;--accent:#e0a050;--align:#1e9fff;--warn:#dc5050;--orange:#ff8c1a;--pink:#c850d4;--green:#28c868;--cyan:#14d4e0;--red:#e03232;--text-hi:#eaeaf0;--text-lo:#646878;--text-mid:#9096ac;--radius:10px;--mono:'Space Mono',monospace;--ui:'Rajdhani',sans-serif}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text-hi);font-family:var(--ui);min-height:100vh;display:flex;flex-direction:column;overflow-x:hidden}
+.layout{display:grid;grid-template-columns:270px 1fr 220px;grid-template-rows:52px 1fr 44px;min-height:100vh}
+.topbar{grid-column:1/-1;background:var(--panel);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 18px;gap:14px}
+.logo{font-family:var(--mono);font-size:.9rem;font-weight:700;color:var(--accent);letter-spacing:.15em}
+.logo span{color:var(--text-lo);font-weight:400}
+.sep{width:1px;height:22px;background:var(--border)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--warn);box-shadow:0 0 6px var(--warn);transition:.3s}
+.dot.on{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+.st{font-family:var(--mono);font-size:.58rem;color:var(--warn);letter-spacing:.1em;transition:.3s}
+.st.on{color:var(--accent)}
+.ml{margin-left:auto;display:flex;gap:10px;align-items:center}
+.badge{font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:4px;padding:2px 8px}
+.pl{background:var(--panel);border-right:1px solid var(--border);padding:14px 12px;display:flex;flex-direction:column;gap:16px;overflow-y:auto}
+.pr{background:var(--panel);border-left:1px solid var(--border);padding:14px 12px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}
+.va{background:#08090c;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden}
+#vc{max-width:100%;max-height:100%;display:block}
+.brackets{position:absolute;inset:0;pointer-events:none}
+.brackets svg{width:100%;height:100%}
+.br{stroke:var(--accent);stroke-width:2;fill:none;opacity:.5;transition:.3s}
+.br.warn{stroke:var(--warn);animation:blink 1s step-start infinite}
+@keyframes blink{50%{opacity:0}}
+.scanline{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.18;pointer-events:none;animation:scan 5s linear infinite}
+@keyframes scan{0%{top:0}100%{top:100%}}
+#overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(8,9,12,.92);gap:10px;z-index:10}
+#overlay .ot{font-family:var(--mono);font-size:.7rem;color:var(--accent);letter-spacing:.15em}
+#overlay .os{font-family:var(--mono);font-size:.6rem;color:var(--text-lo)}
+.spin{width:26px;height:26px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.bot{grid-column:1/-1;background:var(--panel);border-top:1px solid var(--border);display:flex;align-items:center;padding:0 18px;gap:18px}
+.hi{display:flex;align-items:center;gap:6px;font-size:.68rem;color:var(--text-lo);font-family:var(--mono)}
+.hk{background:var(--panel2);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:.58rem;color:var(--accent)}
+.sec{font-family:var(--mono);font-size:.56rem;color:var(--text-lo);letter-spacing:.15em;text-transform:uppercase;margin-bottom:7px;display:flex;align-items:center;gap:8px}
+.sec::after{content:'';flex:1;height:1px;background:var(--border)}
+.sg{display:flex;flex-direction:column;gap:11px}
+.sr{display:flex;flex-direction:column;gap:4px}
+.sh{display:flex;justify-content:space-between;align-items:baseline}
+.sl{font-family:var(--mono);font-size:.56rem;color:var(--text-lo);letter-spacing:.1em;text-transform:uppercase}
+.sv{font-family:var(--mono);font-size:.6rem;color:var(--text-hi);min-width:68px;text-align:right}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:4px;border-radius:2px;background:var(--border);outline:none;cursor:pointer}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px var(--accent);transition:.1s}
+input[type=range]::-webkit-slider-thumb:active{transform:scale(1.4)}
+.btn{width:100%;padding:8px;background:transparent;border:1px solid var(--border);border-radius:var(--radius);color:var(--text-lo);font-family:var(--mono);font-size:.6rem;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:.2s}
+.btn:hover{border-color:var(--align);color:var(--align);background:rgba(30,159,255,.06)}
+.btn-snap{width:100%;padding:10px;background:linear-gradient(135deg,rgba(224,160,80,.15),rgba(224,160,80,.05));border:1px solid var(--accent);border-radius:var(--radius);color:var(--accent);font-family:var(--mono);font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;cursor:pointer;transition:.2s}
+.btn-snap:hover{box-shadow:0 0 16px rgba(224,160,80,.25)}
+.btn-snap:active{transform:scale(.98)}
+.ib{background:var(--panel2);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;font-family:var(--mono);font-size:.54rem;color:var(--text-lo);line-height:1.85;letter-spacing:.04em}
+.ib b{color:var(--text-mid)}
+.lp{background:rgba(224,160,80,.06);border:1px solid rgba(224,160,80,.25);border-radius:var(--radius);padding:8px 10px;font-family:var(--mono);font-size:.54rem;color:var(--accent);line-height:1.9}
+.err{background:rgba(220,80,80,.12);border:1px solid var(--warn);border-radius:var(--radius);padding:8px 12px;font-family:var(--mono);font-size:.57rem;color:var(--warn);display:none}
+</style>
+</head>
+<body>
+<div class="layout">
+  <header class="topbar">
+    <div class="logo">V-Look <span>Mouth</span></div>
+    <div class="sep"></div>
+    <a href="/" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Hair AR</a>
+    <a href="/nose" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Nose Filter</a>
+    <a href="/scar" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Scar Removal</a>
+    <a href="/brow" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Brow Shaper</a>
+    <a href="/mouth" style="font-family:var(--mono);font-size:.58rem;color:var(--accent);background:rgba(224,160,80,.08);border:1px solid var(--accent);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Mouth</a>
+    <div class="sep"></div>
+    <div class="dot" id="dot"></div>
+    <span class="st" id="st">SCANNING...</span>
+    <div class="ml">
+      <div class="badge"><span id="fps" style="color:var(--green)">0.0</span> FPS</div>
+      <div class="badge" id="wsb" style="color:var(--warn)">WS OFF</div>
+    </div>
+  </header>
+
+  <aside class="pl">
+    <div>
+      <div class="sec">Position</div>
+      <div class="sg">
+        <div class="sr">
+          <div class="sh"><span class="sl">Offset X</span><span class="sv" id="vox">+0</span></div>
+          <input type="range" id="ox" class="pink" min="-200" max="200" value="0" step="5">
+        </div>
+        <div class="sr">
+          <div class="sh"><span class="sl">Offset Y</span><span class="sv" id="voy">+0</span></div>
+          <input type="range" id="oy" class="orange" min="-200" max="200" value="0" step="5">
+        </div>
+        <div class="sr">
+          <div class="sh"><span class="sl">Scale</span><span class="sv" id="vsc">100%</span></div>
+          <input type="range" id="sc" class="green" min="30" max="300" value="100" step="1">
+        </div>
+      </div>
+    </div>
+    <button class="btn" onclick="resetSliders()">&hookleftarrow; Reset</button>
+    <div class="lp" id="lp">X: +0 &nbsp; Y: +0 &nbsp; S: 100%</div>
+    <div class="err" id="err"></div>
+  </aside>
+
+  <main class="va">
+    <div id="overlay">
+      <div class="spin"></div>
+      <div class="ot">Connecting to mouth filter server&hellip;</div>
+      <div class="os">python -m uvicorn server:app --port 8000</div>
+    </div>
+    <canvas id="vc" width="640" height="480"></canvas>
+    <div class="brackets">
+      <svg viewBox="0 0 640 480" xmlns="http://www.w3.org/2000/svg">
+        <polyline class="br" id="bTL" points="80,110 58,110 58,88"/>
+        <polyline class="br" id="bTR" points="560,88 582,88 582,110"/>
+        <polyline class="br" id="bBL" points="58,370 58,392 80,392"/>
+        <polyline class="br" id="bBR" points="582,370 582,392 560,392"/>
+      </svg>
+    </div>
+    <div class="scanline"></div>
+  </main>
+
+  <aside class="pr">
+    <div>
+      <div class="sec">Capture</div>
+      <button class="btn-snap" onclick="snap()">&#9679; Screenshot</button>
+    </div>
+    <div>
+      <div class="sec">Controls</div>
+      <div class="ib">
+        <b>W/S</b> up / down<br>
+        <b>A/D</b> left / right<br>
+        <b>-/=</b> shrink / grow<br>
+        <b>R</b> reset position
+      </div>
+    </div>
+    <div>
+      <div class="sec">Tip</div>
+      <div class="ib">
+        Mouth too high:<br>
+        &rarr; <b>W</b> or drag Y more negative<br><br>
+        Mouth too small:<br>
+        &rarr; <b>=</b> or drag Scale up<br><br>
+        Adjust with sliders<br>
+        or keyboard keys
+      </div>
+    </div>
+  </aside>
+
+  <footer class="bot">
+    <div class="hi"><span class="hk">W</span><span class="hk">S</span> up/down</div>
+    <div class="hi"><span class="hk">A</span><span class="hk">D</span> left/right</div>
+    <div class="hi"><span class="hk">-</span><span class="hk">=</span> size</div>
+    <div class="hi"><span class="hk">R</span> reset</div>
+    <div class="hi"><span class="hk">S</span> snapshot</div>
+  </footer>
+</div>
+<script>
+const HOST=location.host;let vidWs=null,ctrlWs=null;
+const DEFAULTS={ox:0,oy:0,sc:100};
+const canvas=document.getElementById('vc'),ctx=canvas.getContext('2d'),img=new Image();
+let fpsBuf=[],fpsTs=performance.now();
+let offX=0,offY=0,scalePct=100;
+const MOVE_STEP=3;
+
+function connectCtl(){
+  ctrlWs=new WebSocket('ws://'+HOST+'/ws/mouth/controls');
+  ctrlWs.onclose=()=>setTimeout(connectCtl,5000);
+}
+function sendCtl(){
+  if(ctrlWs&&ctrlWs.readyState===WebSocket.OPEN)
+    ctrlWs.send(JSON.stringify({offset_x:offX,offset_y:offY,scale_delta:(scalePct-100)/100}));
+}
+function updateLive(){
+  document.getElementById('vox').textContent=(offX>=0?'+':'')+offX;
+  document.getElementById('voy').textContent=(offY>=0?'+':'')+offY;
+  document.getElementById('vsc').textContent=scalePct+'%';
+  document.getElementById('lp').innerHTML='X: '+(offX>=0?'+':'')+offX+' &nbsp; Y: '+(offY>=0?'+':'')+offY+' &nbsp; S: '+scalePct+'%';
+}
+function sliderToVals(){
+  offX=+document.getElementById('ox').value;
+  offY=+document.getElementById('oy').value;
+  scalePct=+document.getElementById('sc').value;
+  updateLive();sendCtl();
+}
+function resetSliders(){
+  offX=DEFAULTS.ox;offY=DEFAULTS.oy;scalePct=DEFAULTS.sc;
+  document.getElementById('ox').value=offX;
+  document.getElementById('oy').value=offY;
+  document.getElementById('sc').value=scalePct;
+  updateLive();sendCtl();
+}
+['ox','oy','sc'].forEach(id=>document.getElementById(id).addEventListener('input',sliderToVals));
+function connectVid(){
+  vidWs=new WebSocket('ws://'+HOST+'/ws/mouth');
+  vidWs.onopen=()=>{
+    document.getElementById('wsb').textContent='WS ON';
+    document.getElementById('wsb').style.color='var(--green)';
+    document.getElementById('overlay').style.display='none';
+  };
+  vidWs.onmessage=ev=>{
+    const d=JSON.parse(ev.data);
+    if(d.error){showErr(d.error);return}
+    img.onload=()=>ctx.drawImage(img,0,0,canvas.width,canvas.height);
+    const fd=d.result||d.frame;
+    if(fd)img.src='data:image/jpeg;base64,'+fd;
+    const on=d.face_found;
+    if(on!==undefined){
+      document.getElementById('dot').className='dot'+(on?' on':'');
+      document.getElementById('st').className='st'+(on?' on':'');
+      document.getElementById('st').textContent=on?'FACE LOCKED':'SCANNING...';
+      ['bTL','bTR','bBL','bBR'].forEach(id=>{
+        document.getElementById(id).className='br'+(on?'':' warn');
+      });
+    }
+    const now=performance.now();
+    fpsBuf.push(1000/Math.max(now-fpsTs,1));fpsTs=now;
+    if(fpsBuf.length>45)fpsBuf.shift();
+    const f=fpsBuf.reduce((a,b)=>a+b,0)/fpsBuf.length;
+    const fe=document.getElementById('fps');
+    fe.textContent=f.toFixed(1);
+    fe.style.color=f>=28?'var(--green)':f>=18?'var(--cyan)':'var(--red)';
+  };
+  vidWs.onerror=()=>showErr('Cannot reach server. Is it running on port 8000?');
+  vidWs.onclose=()=>{
+    document.getElementById('wsb').textContent='WS OFF';
+    document.getElementById('wsb').style.color='#dc5050';
+    document.getElementById('overlay').style.display='flex';
+    setTimeout(connectVid,2500);
+  };
+}
+function showErr(msg){
+  document.getElementById('err').textContent='\\u26a0 '+msg;
+  document.getElementById('err').style.display='block';
+}
+function snap(){
+  const a=document.createElement('a');
+  a.download='mouth_'+Date.now()+'.png';
+  a.href=canvas.toDataURL('image/png');a.click();
+}
+document.addEventListener('keydown',e=>{
+  const k=e.key;
+  if(k==='w'||k==='W'){offY-=MOVE_STEP;document.getElementById('oy').value=offY;updateLive();sendCtl()}
+  else if(k==='s'||k==='S'){offY+=MOVE_STEP;document.getElementById('oy').value=offY;updateLive();sendCtl()}
+  else if(k==='a'||k==='A'){offX-=MOVE_STEP;document.getElementById('ox').value=offX;updateLive();sendCtl()}
+  else if(k==='d'||k==='D'){offX+=MOVE_STEP;document.getElementById('ox').value=offX;updateLive();sendCtl()}
+  else if(k==='-'){scalePct=Math.max(30,scalePct-5);document.getElementById('sc').value=scalePct;updateLive();sendCtl()}
+  else if(k==='='){scalePct=Math.min(300,scalePct+5);document.getElementById('sc').value=scalePct;updateLive();sendCtl()}
+  else if(k==='r'||k==='R'){resetSliders()}
+  else if(k.toLowerCase()==='s')snap();
+});
+connectVid();connectCtl();
+setInterval(async()=>{
+  try{const r=await fetch('/mode');const d=await r.json();if(d.mode!=='mouth')window.location.href='/'}catch{}
+},1000);
+</script>
+</body>
+</html>""")
+
+
+@app.websocket("/ws/mouth")
+async def ws_mouth(ws: WebSocket):
+    await ws.accept()
+    for _ in range(50):
+        if MOUTH.running:
+            break
+        await asyncio.sleep(0.1)
+    if not MOUTH.running:
+        await ws.send_text(json.dumps({"error": "Mouth correction not ready"}))
+        await ws.close()
+        return
+    loop2 = asyncio.get_event_loop()
+    try:
+        while True:
+            try:
+                _, result_b64, face_found = await loop2.run_in_executor(_gl_executor, MOUTH.grab)
+            except Exception as e:
+                print(f"[Mouth] Frame grab error: {e}")
+                await asyncio.sleep(0.1)
+                continue
+            if result_b64 is None:
+                await asyncio.sleep(0.02)
+                continue
+            await ws.send_text(json.dumps({"result": result_b64, "face_found": face_found}))
+            await asyncio.sleep(0.001)
+    except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError):
+        MOUTH.close()
+        print("[Mouth] Client disconnected")
+    except asyncio.CancelledError:
+        print("[Mouth] Server shutting down")
+    except Exception as e:
+        print(f"[Mouth WS] error: {e}")
+
+
+@app.websocket("/ws/mouth/controls")
+async def ws_mouth_ctrl(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            data = json.loads(await ws.receive_text())
+            m = MOUTH.mouth
+            if "offset_x" in data:
+                m.offset_x = int(data["offset_x"])
+            if "offset_y" in data:
+                m.offset_y = int(data["offset_y"])
+            if "scale_delta" in data:
+                m.scale_delta = float(data["scale_delta"])
+            await ws.send_text(json.dumps({"ok": True}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[Mouth Ctrl WS] error: {e}")
+
+
 @app.get("/brow")
 async def brow_page():
     return HTMLResponse("""
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>V-Look Brow Shaper</title>
+<title>V-Look — Brow Shaper + Gesture + Speech</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
 <style>
-  body { margin:0; background:#111; color:#eee; font-family:sans-serif;
-         display:flex; flex-direction:column; align-items:center; height:100vh; }
-  h2 { margin:12px 0 6px; font-weight:300; letter-spacing:2px; }
-  canvas { display:block; max-width:95vw; max-height:80vh; border-radius:8px;
-           box-shadow:0 0 30px rgba(0,200,150,0.15); }
-  .status { margin:8px 0; font-size:13px; opacity:0.6; }
+:root{--bg:#0e0f14;--panel:#16181f;--panel2:#1c1f2b;--border:#32374a;--accent:#e0a050;--align:#1e9fff;--warn:#dc5050;--green:#28c868;--cyan:#14d4e0;--red:#e03232;--text-hi:#eaeaf0;--text-lo:#646878;--text-mid:#9096ac;--radius:10px;--mono:'Space Mono',monospace;--ui:'Rajdhani',sans-serif}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text-hi);font-family:var(--ui);min-height:100vh;display:flex;flex-direction:column;overflow-x:hidden}
+.layout{display:grid;grid-template-columns:270px 1fr 220px;grid-template-rows:52px 1fr 44px;min-height:100vh}
+.topbar{grid-column:1/-1;background:var(--panel);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 18px;gap:14px}
+.logo{font-family:var(--mono);font-size:.9rem;font-weight:700;color:var(--accent);letter-spacing:.15em}
+.logo span{color:var(--text-lo);font-weight:400}
+.sep{width:1px;height:22px;background:var(--border)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--warn);box-shadow:0 0 6px var(--warn);transition:.3s}
+.dot.on{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+.st{font-family:var(--mono);font-size:.58rem;color:var(--warn);letter-spacing:.1em;transition:.3s}
+.st.on{color:var(--accent)}
+.ml{margin-left:auto;display:flex;gap:10px;align-items:center}
+.badge{font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:4px;padding:2px 8px}
+.pl{background:var(--panel);border-right:1px solid var(--border);padding:14px 12px;display:flex;flex-direction:column;gap:16px;overflow-y:auto}
+.pr{background:var(--panel);border-left:1px solid var(--border);padding:14px 12px;display:flex;flex-direction:column;gap:14px;overflow-y:auto}
+.va{background:#08090c;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden}
+#vc{max-width:100%;max-height:100%;display:block}
+.brackets{position:absolute;inset:0;pointer-events:none}
+.brackets svg{width:100%;height:100%}
+.br{stroke:var(--accent);stroke-width:2;fill:none;opacity:.5;transition:.3s}
+.br.warn{stroke:var(--warn);animation:blink 1s step-start infinite}
+@keyframes blink{50%{opacity:0}}
+.scanline{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.18;pointer-events:none;animation:scan 5s linear infinite}
+@keyframes scan{0%{top:0}100%{top:100%}}
+#overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(8,9,12,.92);gap:10px;z-index:10}
+#overlay .ot{font-family:var(--mono);font-size:.7rem;color:var(--accent);letter-spacing:.15em}
+#overlay .os{font-family:var(--mono);font-size:.6rem;color:var(--text-lo)}
+.spin{width:26px;height:26px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.bot{grid-column:1/-1;background:var(--panel);border-top:1px solid var(--border);display:flex;align-items:center;padding:0 18px;gap:18px}
+.hi{display:flex;align-items:center;gap:6px;font-size:.68rem;color:var(--text-lo);font-family:var(--mono)}
+.hk{background:var(--panel2);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:.58rem;color:var(--accent)}
+.sec{font-family:var(--mono);font-size:.56rem;color:var(--text-lo);letter-spacing:.15em;text-transform:uppercase;margin-bottom:7px;display:flex;align-items:center;gap:8px}
+.sec::after{content:'';flex:1;height:1px;background:var(--border)}
+.ib{background:var(--panel2);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;font-family:var(--mono);font-size:.54rem;color:var(--text-lo);line-height:1.85;letter-spacing:.04em}
+.ib b{color:var(--text-mid)}
+.ib .gl{color:var(--accent);font-size:.65rem;font-weight:700}
+.ib .sp{color:var(--cyan);font-size:.65rem}
+.ib .st2{color:var(--green);font-size:.55rem}
+.lp{background:rgba(30,159,255,.06);border:1px solid rgba(30,159,255,.25);border-radius:var(--radius);padding:8px 10px;font-family:var(--mono);font-size:.54rem;color:var(--align);line-height:1.9}
+.btn-snap{width:100%;padding:10px;background:linear-gradient(135deg,rgba(224,160,80,.15),rgba(224,160,80,.05));border:1px solid var(--accent);border-radius:var(--radius);color:var(--accent);font-family:var(--mono);font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;cursor:pointer;transition:.2s}
+.btn-snap:hover{box-shadow:0 0 16px rgba(224,160,80,.25)}
+.err{background:rgba(220,80,80,.12);border:1px solid var(--warn);border-radius:var(--radius);padding:8px 12px;font-family:var(--mono);font-size:.57rem;color:var(--warn);display:none}
 </style>
 </head>
 <body>
-<h2>&#x2728; Brow Shaper</h2>
-<div class="status" id="status">Connecting...</div>
-<canvas id="c"></canvas>
-<p style="margin-top:6px"><a href="/nose" style="font-family:'Space Mono',monospace;font-size:.55rem;color:#646878;text-decoration:none;border:1px solid #32374a;padding:4px 12px;border-radius:6px">Nose Filter &rarr;</a></p>
+<div class="layout">
+  <header class="topbar">
+    <div class="logo">V-Look <span>Brow+Sign+Speech</span></div>
+    <div class="sep"></div>
+    <a href="/" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Hair AR</a>
+    <a href="/nose" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Nose Filter</a>
+    <a href="/scar" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Scar Removal</a>
+    <a href="/brow" style="font-family:var(--mono);font-size:.58rem;color:var(--accent);background:rgba(224,160,80,.08);border:1px solid var(--accent);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Brow Shaper</a>
+    <a href="/mouth" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Mouth</a>
+    <div class="sep"></div>
+    <div class="dot" id="dot"></div>
+    <span class="st" id="st">SCANNING...</span>
+    <div class="ml">
+      <div class="badge"><span id="fps" style="color:var(--green)">0.0</span> FPS</div>
+      <div class="badge" id="wsb" style="color:var(--warn)">WS OFF</div>
+    </div>
+  </header>
+
+  <aside class="pl">
+    <div>
+      <div class="sec">Features</div>
+      <div class="ib">
+        <span class="gl">&#9679; Brow Shaper</span><br>
+        Rounded eyebrow overlay<br>
+        with natural color matching<br><br>
+        <span class="gl">&#9758; Sign Language</span><br>
+        HELLO &bull; YES &bull; NO &bull; BYE<br>
+        THANKS &bull; LIKE IT &bull; DON'T LIKE<br><br>
+        <span class="gl">&#9835; Speech-to-Text</span><br>
+        Google Speech Recognition<br>
+        shown as subtitles
+      </div>
+    </div>
+    <div>
+      <div class="sec">Gesture</div>
+      <div class="lp" id="gesture_display">
+        <span style="color:var(--text-lo);font-size:.85rem">&#x1f590;</span><br>
+        <span id="gesture_text" style="font-weight:700;letter-spacing:.1em">---</span>
+      </div>
+    </div>
+    <div>
+      <div class="sec">Speech</div>
+      <div class="ib">
+        <span class="st2" id="speech_status">Idle</span><br>
+        <span class="sp" id="speech_text"></span>
+      </div>
+    </div>
+  </aside>
+
+  <main class="va">
+    <div id="overlay">
+      <div class="spin"></div>
+      <div class="ot">Connecting to brow shaper server&hellip;</div>
+      <div class="os">python -m uvicorn server:app --port 8000</div>
+    </div>
+    <canvas id="vc" width="640" height="480"></canvas>
+    <div class="brackets">
+      <svg viewBox="0 0 640 480" xmlns="http://www.w3.org/2000/svg">
+        <polyline class="br" id="bTL" points="80,110 58,110 58,88"/>
+        <polyline class="br" id="bTR" points="560,88 582,88 582,110"/>
+        <polyline class="br" id="bBL" points="58,370 58,392 80,392"/>
+        <polyline class="br" id="bBR" points="582,370 582,392 560,392"/>
+      </svg>
+    </div>
+    <div class="scanline"></div>
+  </main>
+
+  <aside class="pr">
+    <div>
+      <div class="sec">Capture</div>
+      <button class="btn-snap" onclick="snap()">&#9679; Screenshot</button>
+    </div>
+    <div>
+      <div class="sec">How it works</div>
+      <div class="ib">
+        <b>Eyebrows</b> &mdash; automatically<br>
+        shaped with rounded fill using<br>
+        MediaPipe face landmarks<br><br>
+        <b>Hand gestures</b> &mdash; recognized<br>
+        via MediaPipe hand landmarks<br><br>
+        <b>Speech</b> &mdash; captured from mic<br>
+        and transcribed in real time
+      </div>
+    </div>
+    <div>
+      <div class="sec">Tip</div>
+      <div class="ib">
+        Face the camera directly.<br>
+        Show hand signs clearly.<br>
+        Speak near the microphone.
+      </div>
+    </div>
+  </aside>
+
+  <footer class="bot">
+    <div class="hi"><span class="hk">S</span> snapshot</div>
+    <div class="hi"><span class="hk">R</span> reset speech</div>
+  </footer>
+</div>
 <script>
-const c = document.getElementById('c'), ctx = c.getContext('2d');
-let ws = null;
-function connect() {
-  ws = new WebSocket('ws://' + location.host + '/ws/brow');
-  ws.onmessage = e => {
-    const d = JSON.parse(e.data);
-    const img = new Image();
-    img.onload = () => { c.width = img.width; c.height = img.height; ctx.drawImage(img,0,0); };
-    img.src = 'data:image/jpeg;base64,' + (d.result || d.original);
-    document.getElementById('status').textContent = 'Live';
+const c=document.getElementById('vc'),ctx=c.getContext('2d');
+const img=new Image();
+let fpsBuf=[],fpsTs=performance.now();
+let ws=null;
+let lastGesture="---",lastSpeech="",lastSpeechStatus="Idle";
+
+function connect(){
+  ws=new WebSocket('ws://'+location.host+'/ws/brow');
+  ws.onopen=()=>{
+    document.getElementById('wsb').textContent='WS ON';
+    document.getElementById('wsb').style.color='var(--green)';
+    document.getElementById('overlay').style.display='none';
   };
-  ws.onclose = () => { document.getElementById('status').textContent = 'Disconnected. Reconnecting...';
-                        setTimeout(connect, 1000); };
-  ws.onerror = () => ws.close();
+  ws.onmessage=e=>{
+    const d=JSON.parse(e.data);
+    if(d.error){document.getElementById('err').textContent='\\u26a0 '+d.error;document.getElementById('err').style.display='block';return}
+    img.onload=()=>ctx.drawImage(img,0,0,c.width,c.height);
+    if(d.result)img.src='data:image/jpeg;base64,'+d.result;
+
+    if(d.gesture!==undefined){
+      lastGesture=d.gesture||'---';
+      document.getElementById('gesture_text').textContent=lastGesture;
+    }
+    if(d.speech_text!==undefined){
+      lastSpeech=d.speech_text;
+      document.getElementById('speech_text').textContent=d.speech_text;
+    }
+    if(d.speech_status!==undefined){
+      lastSpeechStatus=d.speech_status;
+      const se=document.getElementById('speech_status');
+      se.textContent=d.speech_status;
+      if(d.speech_status==='Listening...')se.style.color='var(--green)';
+      else if(d.speech_status==='Processing...')se.style.color='var(--cyan)';
+      else if(d.speech_status==='Got it!')se.style.color='var(--accent)';
+      else se.style.color='var(--text-lo)';
+    }
+
+    const on=d.result!=null;
+    document.getElementById('dot').className='dot'+(on?' on':'');
+    document.getElementById('st').className='st'+(on?' on':'');
+    document.getElementById('st').textContent=on?'STREAMING':'WAITING...';
+    ['bTL','bTR','bBL','bBR'].forEach(id=>{
+      document.getElementById(id).className='br'+(on?'':' warn');
+    });
+
+    const now=performance.now();
+    fpsBuf.push(1000/Math.max(now-fpsTs,1));fpsTs=now;
+    if(fpsBuf.length>45)fpsBuf.shift();
+    const f=fpsBuf.reduce((a,b)=>a+b,0)/fpsBuf.length;
+    const fe=document.getElementById('fps');
+    fe.textContent=f.toFixed(1);
+    fe.style.color=f>=28?'var(--green)':f>=18?'var(--cyan)':'var(--red)';
+  };
+  ws.onerror=()=>{document.getElementById('overlay').style.display='flex'};
+  ws.onclose=()=>{
+    document.getElementById('wsb').textContent='WS OFF';
+    document.getElementById('wsb').style.color='#dc5050';
+    document.getElementById('overlay').style.display='flex';
+    setTimeout(connect,2500);
+  };
 }
 connect();
+
+setInterval(async()=>{
+  try{const r=await fetch('/mode');const d=await r.json();if(d.mode!=='brow')window.location.href='/'}catch{}
+},1000);
+
+function snap(){
+  const a=document.createElement('a');
+  a.download='brow_'+Date.now()+'.png';
+  a.href=c.toDataURL('image/png');a.click();
+}
+document.addEventListener('keydown',e=>{
+  if(e.key.toLowerCase()==='s')snap();
+});
 </script>
 </body>
 </html>
@@ -1082,20 +1713,20 @@ connect();
 @app.websocket("/ws/brow")
 async def ws_brow(ws: WebSocket):
     await ws.accept()
+    for _ in range(50):
+        if BROW.running:
+            break
+        await asyncio.sleep(0.1)
     if not BROW.running:
-        try:
-            loop2 = asyncio.get_event_loop()
-            await loop2.run_in_executor(None, BROW.init)
-        except Exception as e:
-            await ws.send_text(json.dumps({"error": str(e)}))
-            await ws.close()
-            return
+        await ws.send_text(json.dumps({"error": "Brow shaper not ready"}))
+        await ws.close()
+        return
 
     loop2 = asyncio.get_event_loop()
     try:
         while True:
             try:
-                _, result_b64 = await loop2.run_in_executor(None, BROW.grab)
+                result_b64, gesture, speech_text, speech_status = await loop2.run_in_executor(_gl_executor, BROW.grab)
             except Exception as e:
                 print(f"[Brow] Frame grab error: {e}")
                 await asyncio.sleep(0.1)
@@ -1103,9 +1734,15 @@ async def ws_brow(ws: WebSocket):
             if result_b64 is None:
                 await asyncio.sleep(0.02)
                 continue
-            await ws.send_text(json.dumps({"result": result_b64}))
+            await ws.send_text(json.dumps({
+                "result": result_b64,
+                "gesture": gesture,
+                "speech_text": speech_text,
+                "speech_status": speech_status,
+            }))
             await asyncio.sleep(0.001)
     except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError):
+        BROW.close()
         print("[Brow] Client disconnected")
     except asyncio.CancelledError:
         print("[Brow] Server shutting down")

@@ -188,9 +188,10 @@ input[type=range].green::-webkit-slider-thumb  { background:var(--green);  box-s
     <div class="logo">V-Look <span>AR</span></div>
     <div class="sep"></div>
     <button class="mode-btn active" data-mode="hair" onclick="switchMode('hair')" style="font-family:var(--mono);font-size:.58rem;color:var(--accent);background:rgba(0,210,170,.08);border:1px solid var(--accent);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Hair AR</button>
-    <button class="mode-btn" data-mode="scar" onclick="switchMode('scar')" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Scar Removal</button>
-    <button class="mode-btn" data-mode="brow" onclick="switchMode('brow')" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Brow Shaper</button>
+    <button class="mode-btn" data-mode="scar" onclick="window.location.href='/scar'" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Scar Removal</button>
+    <button class="mode-btn" data-mode="brow" onclick="window.location.href='/brow'" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Brow Shaper</button>
     <button class="mode-btn" data-mode="nose" onclick="window.location.href='/nose'" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Nose Filter</button>
+    <button class="mode-btn" data-mode="mouth" onclick="window.location.href='/mouth'" style="font-family:var(--mono);font-size:.58rem;color:var(--text-lo);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 12px;cursor:pointer;letter-spacing:.08em;text-decoration:none;transition:.2s">Mouth</button>
     <div class="sep"></div>
     <div class="dot" id="dot"></div>
     <span class="st" id="st">SCANNING...</span>
@@ -354,7 +355,7 @@ const ctx    = canvas.getContext('2d');
 const img    = new Image();
 
 // ── Mode switching ─────────────────────────────────────────────
-const WS_PATHS = { hair: '/ws/video', scar: '/ws/scar', brow: '/ws/brow' };
+const WS_PATHS = { hair: '/ws/video', scar: '/ws/scar', brow: '/ws/brow', nose: '/ws/nose' };
 
 function switchMode(mode) {
   currentMode = mode;
@@ -449,11 +450,14 @@ function getParams() {
 }
 
 // ── Controls WS (hair mode only) ───────────────────────────────
+let _ctrlReconnectTimer = null;
 function connectCtrl() {
+  if (_ctrlReconnectTimer) { clearTimeout(_ctrlReconnectTimer); _ctrlReconnectTimer = null; }
+  if (ctrlWs && (ctrlWs.readyState === WebSocket.OPEN || ctrlWs.readyState === WebSocket.CONNECTING)) return;
   ctrlWs = new WebSocket(`ws://${HOST}/ws/controls`);
   ctrlWs.onopen  = () => { console.log('[ctrl] connected'); send(); };
-  ctrlWs.onerror = () => setTimeout(connectCtrl, 2000);
-  ctrlWs.onclose = () => setTimeout(connectCtrl, 2000);
+  ctrlWs.onerror = () => { _ctrlReconnectTimer = setTimeout(connectCtrl, 5000); };
+  ctrlWs.onclose = () => { _ctrlReconnectTimer = setTimeout(connectCtrl, 5000); };
 }
 function send() {
   if (ctrlWs && ctrlWs.readyState === WebSocket.OPEN)
@@ -531,10 +535,35 @@ document.addEventListener('keydown', e => {
   }
 });
 
-// ── Boot ───────────────────────────────────────────────────────
-updateLiveParams();
-connectVid();
-connectCtrl();
+// ── Mode auto-redirect ─────────────────────────────────────────
+const MODE_URLS = { hair: '/', nose: '/nose', scar: '/scar', brow: '/brow', mouth: '/mouth' };
+
+async function fetchMode() {
+  try {
+    const r = await fetch(`http://${HOST}/mode`);
+    const d = await r.json();
+    return d.mode;
+  } catch { return 'hair'; }
+}
+
+async function boot() {
+  const mode = await fetchMode();
+  const url = MODE_URLS[mode] || '/';
+  if (window.location.pathname !== url) {
+    window.location.href = url;
+    return;
+  }
+  updateLiveParams();
+  connectVid();
+  connectCtrl();
+  // Poll every 1s — if mode changed, redirect
+  setInterval(async () => {
+    const m = await fetchMode();
+    const u = MODE_URLS[m] || '/';
+    if (window.location.pathname !== u) window.location.href = u;
+  }, 1000);
+}
+boot();
 </script>
 </body>
 </html>
